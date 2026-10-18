@@ -259,9 +259,9 @@ def test_computed_series_uses_one_native_request(tmp_path, monkeypatch, observat
                 self.original = original
                 self.count = 0
 
-            def analytics(self, specification):
+            def analytics_native(self, specification):
                 self.count += 1
-                return self.original.analytics(specification)
+                return self.original.analytics_native(specification)
 
             def __getattr__(self, name):
                 return getattr(self.original, name)

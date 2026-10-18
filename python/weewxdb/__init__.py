@@ -2,7 +2,6 @@
 
 import weakref
 import re
-import json
 
 from . import _weewxdb
 
@@ -15,10 +14,10 @@ def astronomy(timestamp, latitude, longitude, elevation=0.0, body='sun',
               pressure=1010.0, temperature=15.0, horizon=0.0,
               operation='position', start=None, stop=None, center=False):
     """Calculate a position, event range or lunar phases in the Rust core."""
-    return json.loads(_weewxdb.astronomy(json.dumps({
+    return _weewxdb.astronomy_native({
         'time': timestamp, 'latitude': latitude, 'longitude': longitude, 'elevation': elevation,
         'body': body, 'pressure': pressure, 'temperature': temperature, 'horizon': horizon,
-        'operation': operation, 'start': start, 'stop': stop, 'center': center})))
+        'operation': operation, 'start': start, 'stop': stop, 'center': center})
 
 
 class Error(Exception):

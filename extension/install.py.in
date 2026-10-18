@@ -1,0 +1,44 @@
+"""Installer for the complete platform-specific WeeWX database extension."""
+
+import importlib.util
+import os
+import platform
+from pathlib import Path
+
+from weecfg.extension import ExtensionInstaller, InstallError
+
+FILES = @FILES@
+PLATFORM = @PLATFORM@
+VERSION = @VERSION@
+
+
+def loader():
+    return WeeWXDBInstaller()
+
+
+class WeeWXDBInstaller(ExtensionInstaller):
+    def __init__(self):
+        native = Path(__file__).parent / 'bin/user/weewxdb/_weewxdb.abi3.so'
+        if native.is_file():
+            if (platform.system(), platform.machine()) != PLATFORM:
+                raise InstallError('This archive is for %s %s; build an archive on the target system.' % PLATFORM)
+            try:
+                spec = importlib.util.spec_from_file_location('_weewxdb', native)
+                importlib.util.module_from_spec(spec)
+            except (ImportError, OSError) as error:
+                raise InstallError('The bundled Rust module cannot load on this system: %s' % error) from error
+        super().__init__(name='weewx-db', version=VERSION,
+                         description='Rust archive database, native XTypes and solar/lunar almanac',
+                         author='Manuel Hilgert',
+                         files=FILES,
+                         xtype_services=['user.weewxdb.services.NativeServices'],
+                         config={'Databases': {'weewx_rust': {
+                             'driver': 'user.weewxdb.driver', 'database_name': 'weewx.wwdb',
+                             'SQLITE_ROOT': 'archive', 'cache_mib': 32, 'workspace_mib': 32,
+                             'sync_mode': 'background'}}})
+
+    def configure(self, engine):
+        if not engine.dry_run:
+            executable = Path(engine.root_dict['WEEWX_ROOT']) / 'bin/user/weewxdb/weewx-db'
+            os.chmod(executable, 0o755)
+        return False

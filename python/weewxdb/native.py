@@ -1,5 +1,6 @@
 """Keep WeeWX dispatch and calendar rules around native calculation requests."""
 
+import contextvars
 import contextlib
 import datetime
 import hashlib
@@ -32,6 +33,7 @@ EXTRA_AGGREGATES = {'median', 'percentile', 'stddev', 'stddev_samp', 'variance',
                     'slope', 'rms', 'weighted_avg', 'integral', 'maxgap', 'longest_ge', 'longest_lt'}
 HISTORICAL = {'historical_min', 'historical_max', 'historical_min_avg', 'historical_max_avg',
               'historical_mintime', 'historical_maxtime', 'historical_avg'}
+report_source = contextvars.ContextVar('weewxdb_report_source', default=(None, 'auto'))
 _provider_locks = weakref.WeakKeyDictionary()
 _xaggs_sources = {}
 
@@ -149,7 +151,7 @@ def request(manager, query):
     query.setdefault('table', manager.table_name)
     query.setdefault('unit_system', manager.std_unit_system)
     try:
-        return json.loads(manager.connection.native.analytics(json.dumps(query, separators=(',', ':'))))
+        return manager.connection.native.analytics_native(query)
     except ValueError as error:
         if 'integer precision requires SQL' in str(error):
             raise weewx.UnknownType(query['observation']) from error
@@ -248,6 +250,27 @@ def query_for(observation, span, aggregate, manager, options):
     start, stop = map(math.floor, span)
     query = {'mode': 'archive', 'observation': observation, 'aggregate': aggregate,
              'ranges': [[start, stop]], 'threshold': None}
+    source = options.get('source', 'auto')
+    if source not in ['auto', 'stored', 'derived', 'fill_missing']:
+        raise ValueError('Unknown source policy: %s' % source)
+    if source != 'auto':
+        if aggregate not in ['avg', 'min', 'max', 'sum', 'count', 'not_null',
+                              'mintime', 'maxtime', 'first', 'last', 'firsttime',
+                              'lasttime', 'cumulative', 'weighted_avg', 'integral']:
+            raise weewx.UnknownAggregation(aggregate)
+        query['source'] = source
+        if source == 'stored':
+            if observation not in manager.sqlkeys or not dispatch_allowed('get_aggregate', weewx.xtypes.ArchiveTable):
+                raise weewx.UnknownType(observation)
+        else:
+            provider = scalar_provider(observation)
+            if provider is None or not dispatch_allowed('get_aggregate', weewx.xtypes.XTypeTable):
+                raise weewx.UnknownType(observation)
+            spec = weather_specification(observation, manager, provider, manager.std_unit_system)
+            if any(name not in manager.sqlkeys for name in spec['inputs']):
+                raise weewx.UnknownType(observation)
+            query.update(mode='weather', weather=spec)
+        return query
     if aggregate in HISTORICAL:
         if not dispatch_allowed('get_aggregate', None):
             raise weewx.UnknownAggregation(aggregate)
@@ -324,19 +347,23 @@ def aggregate(observation, span, aggregate_type, manager, **options):
     # Keep the existing two-column kernels, including their no-record-loading
     # contract, for the previously implemented five simple reductions.
     if observation in ['dewpoint', 'inDewpoint', 'humidex', 'heatindex'] \
-            and observation not in manager.sqlkeys and aggregate_type in ['sum', 'avg', 'min', 'max', 'count']:
+            and options.get('source', 'auto') == 'auto' and observation not in manager.sqlkeys and aggregate_type in ['sum', 'avg', 'min', 'max', 'count']:
         raise weewx.UnknownType(observation)
     supported = set(weewx.xtypes.ArchiveTable.valid_aggregate_types) \
         | set(weewx.xtypes.DailySummaries.agg_sql_dict) | HISTORICAL | EXTRA_AGGREGATES \
         | {'avg_gt', 'avg_lt', 'not_null'}
     if aggregate_type not in supported:
         raise weewx.UnknownAggregation(aggregate_type)
-    provider = scalar_provider(observation) if observation not in manager.sqlkeys else None
+    provider = scalar_provider(observation) if observation not in manager.sqlkeys or options.get('source') in ['derived', 'fill_missing'] else None
     with provider_lock(provider) if provider is not None else contextlib.nullcontext():
         query = query_for(observation, span, aggregate_type, manager, options)
         result = request(manager, query)
         if provider is not None and query['mode'] == 'weather':
             apply_state(provider, observation, result['state'], manager)
+    return finish_aggregate(observation, aggregate_type, manager, query, result)
+
+
+def finish_aggregate(observation, aggregate_type, manager, query, result):
     value = result['values'][0] if result['values'] else (0 if aggregate_type == 'sum' else None)
     if isinstance(value, list):
         value = complex(*value)
@@ -357,51 +384,44 @@ def aggregate(observation, span, aggregate_type, manager, **options):
     return weewx.units.ValueTuple(value, unit, group)
 
 
-def series(observation, span, manager, aggregate_type=None, aggregate_interval=None, **options):
+def prepare_series(observation, span, manager, aggregate_type=None, aggregate_interval=None, **options):
+    """Plan a series using WeeWX calendar boundaries and dispatcher priority."""
     if getattr(manager.connection, 'native', None) is None:
         raise weewx.UnknownType(observation)
-    old_weather = observation in ['dewpoint', 'inDewpoint', 'humidex', 'heatindex']
-    old_aggregate = aggregate_type in [None, 'sum', 'avg', 'count', 'min', 'max', 'cumulative']
     interval = weeutil.weeutil.nominal_spans(aggregate_interval) if aggregate_type else None
-    use_daily = aggregate_type in weewx.xtypes.DailySummaries.common \
+    use_daily = options.get('source', 'auto') == 'auto' \
+        and aggregate_type in weewx.xtypes.DailySummaries.common \
         and eligible(observation, span, manager, aggregate_type) \
         and interval is not None and (interval % 86400 == 0 or interval in [
             weeutil.weeutil.nominal_intervals['month'], weeutil.weeutil.nominal_intervals['year']])
-    if old_aggregate and (old_weather or observation in manager.sqlkeys) and not use_daily:
-        raise weewx.UnknownType(observation)
     if not dispatch_allowed('get_series', weewx.xtypes.ArchiveTable):
         raise weewx.UnknownType(observation)
     start, stop = map(math.floor, span)
-    provider = scalar_provider(observation) if observation not in manager.sqlkeys else None
-    with provider_lock(provider) if provider is not None else contextlib.nullcontext():
-        if aggregate_type is None:
-            query = query_for(observation, span, 'avg', manager, options)
-            query.update(raw=True)
-            result = request(manager, query)
-            starts, stops = result['starts'], result['stops']
-        else:
-            if aggregate_interval is None:
-                raise weewx.UnknownAggregation(aggregate_interval)
-            if use_daily:
-                if interval == weeutil.weeutil.nominal_intervals['month']:
-                    spans = weeutil.weeutil.genMonthSpans(start, stop)
-                elif interval == weeutil.weeutil.nominal_intervals['year']:
-                    spans = weeutil.weeutil.genYearSpans(start, stop)
-                else:
-                    spans = weeutil.weeutil.intervalgen(weeutil.weeutil.startOfDay(start), stop, interval)
-                ranges = [(max(math.floor(s.start), start), min(math.floor(s.stop), stop)) for s in spans]
-                query = query_for(observation, span, aggregate_type, manager, options)
-                query['ranges'] = ranges
+    ranges = []
+    if aggregate_type is None:
+        query = query_for(observation, span, 'avg', manager, options)
+        query.update(raw=True)
+    else:
+        if aggregate_interval is None:
+            raise weewx.UnknownAggregation(aggregate_interval)
+        if use_daily:
+            if interval == weeutil.weeutil.nominal_intervals['month']:
+                spans = weeutil.weeutil.genMonthSpans(start, stop)
+            elif interval == weeutil.weeutil.nominal_intervals['year']:
+                spans = weeutil.weeutil.genYearSpans(start, stop)
             else:
-                ranges = [(math.floor(s.start), math.floor(s.stop))
-                          for s in weeutil.weeutil.intervalgen(start, stop, aggregate_interval)
-                          if manager.first_timestamp is not None and s.stop > manager.first_timestamp
-                          and manager.last_timestamp is not None and s.start < manager.last_timestamp]
-                if not ranges:
-                    unit, group = weewx.units.getStandardUnitType(None, observation, aggregate_type)
-                    return (weewx.units.ValueTuple([], 'unix_epoch', 'group_time'),
-                            weewx.units.ValueTuple([], 'unix_epoch', 'group_time'),
-                            weewx.units.ValueTuple([], unit, group))
+                spans = weeutil.weeutil.intervalgen(weeutil.weeutil.startOfDay(start), stop, interval)
+            ranges = [(max(math.floor(s.start), start), min(math.floor(s.stop), stop)) for s in spans]
+            query = query_for(observation, span, aggregate_type, manager, options)
+            query['ranges'] = ranges
+        else:
+            ranges = [(math.floor(s.start), math.floor(s.stop))
+                      for s in weeutil.weeutil.intervalgen(start, stop, aggregate_interval)
+                      if manager.first_timestamp is not None and s.stop > manager.first_timestamp
+                      and manager.last_timestamp is not None and s.start < manager.last_timestamp]
+            if not ranges:
+                query = {'mode': 'archive', 'observation': observation, 'aggregate': aggregate_type, 'ranges': []}
+            else:
                 query = query_for(observation, ranges[0], 'sum' if aggregate_type == 'cumulative' else aggregate_type, manager, options)
                 query['ranges'] = ranges
                 if query['mode'] == 'historical':
@@ -415,17 +435,20 @@ def series(observation, span, manager, aggregate_type=None, aggregate_interval=N
                     query['ranges'] = [(weeutil.weeutil.startOfDay(a), b) for a, b in ranges]
                 if aggregate_type == 'cumulative':
                     query['aggregate'] = 'cumulative'
-            result = request(manager, query)
-            starts, stops = [r[0] for r in ranges], [r[1] for r in ranges]
-            if use_daily:
-                occupied = [i for i, count in enumerate(result['rows']) if count]
-                starts = [result['starts'][i] for i in occupied]
-                stops = [int(time.mktime((datetime.date.fromtimestamp(result['stops'][i]) + datetime.timedelta(days=1)).timetuple())) for i in occupied]
-                result['values'] = [result['values'][i] for i in occupied]
-        if provider is not None and query['mode'] == 'weather':
-            apply_state(provider, observation, result['state'], manager)
-    values = [complex(*v) if isinstance(v, list) else v for v in result['values']]
-    units = manager.std_unit_system
+    return query, ranges, use_daily
+
+
+def finish_series(observation, aggregate_type, manager, plan, result):
+    query, ranges, use_daily = plan
+    starts, stops = ([r[0] for r in ranges], [r[1] for r in ranges]) if aggregate_type else (result['starts'], result['stops'])
+    values = result['values']
+    if use_daily:
+        occupied = [i for i, count in enumerate(result['rows']) if count]
+        starts = [result['starts'][i] for i in occupied]
+        stops = [int(time.mktime((datetime.date.fromtimestamp(result['stops'][i]) + datetime.timedelta(days=1)).timetuple())) for i in occupied]
+        values = [values[i] for i in occupied]
+    values = [complex(*v) if isinstance(v, list) else v for v in values]
+    units = manager.std_unit_system if ranges or aggregate_type is None else None
     if query['mode'] in ['weather', 'vector']:
         units = next((unit for unit in result['units'] if unit is not None), None)
     unit, group = weewx.units.getStandardUnitType(units, observation, aggregate_type)
@@ -435,3 +458,18 @@ def series(observation, span, manager, aggregate_type=None, aggregate_interval=N
     return (weewx.units.ValueTuple(starts, 'unix_epoch', 'group_time'),
             weewx.units.ValueTuple(stops, 'unix_epoch', 'group_time'),
             weewx.units.ValueTuple(values, unit, group))
+
+
+def series(observation, span, manager, aggregate_type=None, aggregate_interval=None, **options):
+    provider = scalar_provider(observation) if observation not in manager.sqlkeys or options.get('source') in ['derived', 'fill_missing'] else None
+    with provider_lock(provider) if provider is not None else contextlib.nullcontext():
+        plan = prepare_series(observation, span, manager, aggregate_type, aggregate_interval, **options)
+        old_weather = observation in ['dewpoint', 'inDewpoint', 'humidex', 'heatindex']
+        old_aggregate = aggregate_type in [None, 'sum', 'avg', 'count', 'min', 'max', 'cumulative']
+        if options.get('source', 'auto') == 'auto' and old_aggregate \
+                and (old_weather or observation in manager.sqlkeys) and not plan[2]:
+            raise weewx.UnknownType(observation)
+        result = request(manager, plan[0])
+        if provider is not None and plan[0]['mode'] == 'weather':
+            apply_state(provider, observation, result['state'], manager)
+    return finish_series(observation, aggregate_type, manager, plan, result)

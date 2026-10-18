@@ -73,7 +73,9 @@ class NativeXType(weewx.xtypes.XType):
         try:
             return calculations.series(obs_type, timespan, db_manager, aggregate_type,
                                        aggregate_interval, **options)
-        except (weewx.UnknownType, weewx.UnknownAggregation):
+        except (weewx.UnknownType, weewx.UnknownAggregation) as error:
+            if options.get('source', 'auto') != 'auto':
+                raise weewx.UnsupportedFeature('Unsupported explicit source policy for %s' % obs_type) from error
             pass
         if not calculations.dispatch_allowed('get_series', weewx.xtypes.ArchiveTable) \
                 or aggregate_type is not None and not calculations.dispatch_allowed('get_aggregate', weewx.xtypes.ArchiveTable):
@@ -137,9 +139,14 @@ class NativeXType(weewx.xtypes.XType):
 
     def get_aggregate(self, obs_type, timespan, aggregate_type, db_manager, **options):
         from . import native as calculations
+        observation, source = calculations.report_source.get()
+        if obs_type == observation and source != 'auto':
+            options = dict(options, source=source)
         try:
             return calculations.aggregate(obs_type, timespan, aggregate_type, db_manager, **options)
-        except (weewx.UnknownType, weewx.UnknownAggregation):
+        except (weewx.UnknownType, weewx.UnknownAggregation) as error:
+            if options.get('source', 'auto') != 'auto':
+                raise weewx.UnsupportedFeature('Unsupported explicit source policy for %s' % obs_type) from error
             pass
         native = getattr(db_manager.connection, 'native', None)
         if native is None or obs_type in db_manager.sqlkeys:

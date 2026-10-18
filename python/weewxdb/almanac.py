@@ -8,13 +8,13 @@ import weewx
 import weewx.almanac
 import weewx.units
 
-import weewxdb
+from . import astronomy
 
 
 @functools.lru_cache(maxsize=128)
 def calculate(observer, body, operation, start=None, stop=None, center=False):
     timestamp, latitude, longitude, elevation, pressure, temperature, horizon = observer
-    return weewxdb.astronomy(timestamp, latitude, longitude, elevation, body,
+    return astronomy(timestamp, latitude, longitude, elevation, body,
                              pressure, temperature, horizon, operation, start, stop, center)
 
 

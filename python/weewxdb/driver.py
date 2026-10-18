@@ -6,7 +6,7 @@ import os
 import weedb
 import weedb.sqlite
 
-import weewxdb
+from . import connect as db_connect, IntegrityError, ProgrammingError, DatabaseError
 from . import _weewxdb
 
 
@@ -15,11 +15,11 @@ def guard(function):
     def guarded(*args, **kwargs):
         try:
             return function(*args, **kwargs)
-        except weewxdb.IntegrityError as error:
+        except IntegrityError as error:
             raise weedb.IntegrityError(error) from error
-        except weewxdb.ProgrammingError as error:
+        except ProgrammingError as error:
             raise weedb.ProgrammingError(error) from error
-        except weewxdb.DatabaseError as error:
+        except DatabaseError as error:
             message = str(error)
             if 'no such table' in message:
                 raise weedb.NoTableError(error) from error
@@ -65,7 +65,7 @@ class Connection(weedb.Connection):
         self.file_path = _path(database_name, SQLITE_ROOT)
         if not os.path.isfile(self.file_path):
             raise weedb.NoDatabaseError(self.file_path)
-        connection = weewxdb.connect(self.file_path, timeout=float(options.get('timeout', 5)),
+        connection = db_connect(self.file_path, timeout=float(options.get('timeout', 5)),
                                      cache_mib=int(options.get('cache_mib', 32)),
                                      workspace_mib=int(options.get('workspace_mib', 32)),
                                      sync_mode=options.get('sync_mode', 'background'))

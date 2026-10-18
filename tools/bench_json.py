@@ -31,7 +31,7 @@ def outputs(directory):
     return result
 
 
-def generator(binding, output, timestamp, observations=None):
+def generator(binding, output, timestamp, observations=None, generator_class=None):
     config = configobj.ConfigObj({
         'WEEWX_ROOT': '/',
         'DataBindings': {'wx_binding': {'database': 'trial',
@@ -53,7 +53,7 @@ def generator(binding, output, timestamp, observations=None):
         skin['JSONGenerator']['JSONFiles'] = {
             observation: {observation: {}}
             for observation in observations}
-    return weewx.jsongenerator.JSONGenerator(
+    return (generator_class or weewx.jsongenerator.JSONGenerator)(
         config, configobj.ConfigObj(skin.dict(), interpolation=False), timestamp, True,
         weewx.station.StationInfo(latitude=52, longitude=13, altitude=[40, 'meter']))
 
@@ -88,6 +88,8 @@ def main():
     parser.add_argument('--cache-mib', type=int, default=32)
     parser.add_argument('--workspace-mib', type=int, default=64)
     parser.add_argument('--source-ref', default='unspecified')
+    parser.add_argument('--batch', action='store_true', help='Use the extension JSON adapter for the Rust backend')
+    parser.add_argument('--extremes', action='store_true', help='Include per-bin min/max for each observation')
     parser.add_argument('--computed', action='store_true',
                         help='Generate on-demand dewpoint, humidex and heatindex instead of stored sensors')
     parser.add_argument('--observations', help='Comma-separated derived observations to generate')
@@ -116,8 +118,14 @@ def main():
     for iteration in range(options.rounds):
         with tempfile.TemporaryDirectory(prefix='weewxdb-json-') as directory:
             roots = [Path(directory) / 'sqlite', Path(directory) / 'weewxdb']
-            instances = [generator(binding, output, last - 300, observations)
-                         for binding, output in zip(bindings, roots)]
+            if options.batch:
+                from weewxdb.json import JSONGenerator
+            instances = [generator(binding, output, last - 300, observations,
+                                   JSONGenerator if options.batch and i == 1 else None)
+                         for i, (binding, output) in enumerate(zip(bindings, roots))]
+            if options.extremes:
+                for instance in instances:
+                    instance.skin_dict['JSONGenerator']['Archive']['extremes'] = observations or ['outTemp', 'rain', 'windSpeed']
             try:
                 for phase in samples:
                     for index in ([0, 1] if iteration % 2 == 0 else [1, 0]):
@@ -147,7 +155,7 @@ def main():
                       'weewxdb_median_ms': native, 'speedup': baseline / native,
                       'sqlite_samples_ms': timings[0], 'weewxdb_samples_ms': timings[1]})
     print(json.dumps({'generator_ref': options.source_ref,
-                      'generator_source': weewx.jsongenerator.__file__,
+                      'generator_source': weewx.jsongenerator.__file__, 'batch_adapter': options.batch, 'extremes': options.extremes,
                       'execution': execution_details(),
                       'cache_mib': options.cache_mib, 'workspace_mib': options.workspace_mib,
                       'rounds': options.rounds, 'json_files': count, 'json_bytes': byte_count,

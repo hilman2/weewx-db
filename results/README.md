@@ -255,6 +255,68 @@ restoring it passed. The [mutation report](v2-astronomy-mutation.json) retains
 the failure. Removing the custom-provider dispatch guard also made its
 priority test fail; restoring it passed.
 
+## Batched XTypes and the WeeWX extension
+
+The [extension](../extension.md) combines the database, driver and native
+calculation providers in one platform archive. Its JSON adapter subclasses the
+installed generator. The checked generator source is `28ac6ab8691b`, the pinned
+reference for the WeeWX 5.6 integration. Final released 5.6 compatibility remains
+to be checked against the shipped generator.
+
+On the same CPU 6, a 365-day query asks for hourly ET, appTemp and windchill,
+each as avg/min/max. The SQLite baseline excludes the native XType provider.
+Both database caches are set to 32 MiB; Rust workspace is 32 MiB. Three timed
+rounds per engine use a warm OS cache. All vectors, units, timestamps and NULLs
+match WeeWX within the recorded float tolerance.
+
+| Execution | Median ms |
+| --- | ---: |
+| SQLite and Python XTypes | 11509.007 |
+| Rust, nine separate queries | 610.186 |
+| Rust, one batch | 327.546 |
+
+Batching adds a 1.86x gain over separate Rust requests and a
+35.14x gain over the SQLite/Python baseline. One archive cursor serves
+all observations. Each source formula runs once per record, for 315,360 formula
+evaluations across the three observations. Low workspace budgets split sources
+into smaller groups while retaining all reductions of each source together.
+The [raw report](v2-batch-cpu6.json) records samples and affinity.
+
+A complete JSON comparison adds min/max arrays to the same three-observation
+report on the ten-year fixture. It produces 56 files and 1,970,269 bytes. This is
+one timed run per phase, rather than a three-round median. Cache is 32 MiB and
+workspace is 64 MiB. Day/night files are disabled in this throughput comparison.
+
+| JSON phase | SQLite ms | Extension ms |
+| --- | ---: | ---: |
+| rebuild | 108705.580 | 5209.774 |
+| incremental | 129.267 | 86.961 |
+| idle | 1.764 | 1.830 |
+
+The [JSON report](v2-json-batch-extremes-cpu6.json) records output equivalence
+and configuration. Incremental generation reuses the base generator's resume
+cache. Idle generation has no useful speed advantage.
+
+The [mutation report](v2-batch-mutations.json) records failures after deliberately
+breaking source policies, cache invalidation, formula sharing, all-NULL sensor
+selection and resume caching. Restoring each change passes its test. The final
+suite has 468 passing Python tests with the JSON reference, 462 with the base
+reference plus one skipped JSON module, and 22 Rust tests. The extension tests
+install, run and remove a complete archive in a temporary WeeWX station.
+No Raspberry Pi timing was collected.
+
+Reproduce with the complex fixture from the preceding section:
+
+```sh
+PYTHONPATH=build/weewx-db-trial/json-source/src taskset -c 6 .venv/bin/python \
+    tools/bench_batch.py build/weewx-db-trial/complex.sdb \
+    build/weewx-db-trial/complex.wwdb --rounds 3
+PYTHONPATH=build/weewx-db-trial/json-source/src taskset -c 6 .venv/bin/python \
+    tools/bench_json.py build/weewx-db-trial/complex.sdb \
+    build/weewx-db-trial/complex.wwdb --rounds 1 --batch --extremes \
+    --observations ET,appTemp,windchill --source-ref 28ac6ab8691b
+```
+
 ## Finding daily records
 
 These queries search 3,650 stored daily summaries across the complete archive.

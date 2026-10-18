@@ -22,9 +22,10 @@ pub struct Query {
     #[serde(default)] pub lower_inclusive: bool,
     #[serde(default)] pub parameters: crate::weather::Parameters,
     #[serde(default)] pub scalar_args: Option<Vec<Option<f64>>>,
+    #[serde(default)] pub source: String,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct Answer {
     pub values: Vec<Json>,
     pub rows: Vec<u64>,
@@ -174,6 +175,9 @@ impl Store {
     }
 
     fn weather_analytics(&mut self, query: &Query) -> Result<Answer> {
+        if !query.source.is_empty() && query.source != "auto" && query.scalar_args.is_none() && !query.raw {
+            return Ok(self.analytics_many(std::slice::from_ref(query))?.answers.remove(0));
+        }
         if let Some(args) = &query.scalar_args {
             let mut state = crate::window::WindowState::new(self,query)?;
             let value = state.evaluate(self,query.weather.as_ref().context("scalar formula missing")?,query.ranges[0].1,args)?;
@@ -181,6 +185,7 @@ impl Store {
         }
         let mut names = query.weather.as_ref().map(|w|w.inputs.clone()).unwrap_or_else(||vec![query.observation.clone()]);
         let inputs = names.len(); names.extend(["usUnits".into(),"interval".into()]);
+        if query.source == "fill_missing" { names.push(query.observation.clone()); }
         let columns = indices(self,&query.table,&names)?;
         if query.weather.is_none() { ensure!(columns[0].is_some(),"unknown observation"); }
         if query.weather.is_none()&&self.columns(&query.table)?[columns[0].unwrap()].kind==Kind::Integer {
@@ -207,7 +212,11 @@ impl Store {
             }
             units[index] = unit;
             let value = if let Some(weather) = &query.weather {
-                state.evaluate(self,weather,cursor.time,&values[..inputs])?
+                let calculated = state.evaluate(self,weather,cursor.time,&values[..inputs])?;
+                let calculated = if matches!(query.source.as_str(),"derived"|"fill_missing") {
+                    standard_value(calculated,&weather.formula,unit)
+                } else {calculated};
+                if query.source == "fill_missing" {values[inputs+2].or(calculated)} else {calculated}
             } else {values[0]};
             if query.raw {
                 ensure!(answer.values.len() < self.workspace_bytes/64,"raw series workspace exceeded");
@@ -478,4 +487,178 @@ fn compare(value: f64, target: Option<f64>, aggregate: &str) -> Result<bool> {
 
 pub fn vector_direction(x: f64, y: f64) -> Option<f64> {
     if x == 0.0 && y == 0.0 {None} else {let degrees = 90.0-y.atan2(x).to_degrees();Some(if degrees < 0.0 {degrees+360.0} else {degrees})}
+}
+
+#[derive(Serialize)]
+pub struct BatchAnswer {
+    pub answers: Vec<Answer>,
+    pub scans: usize,
+    pub formula_evaluations: u64,
+}
+
+fn source_key(query: &Query) -> Result<Json> {
+    let mut key = serde_json::to_value(query)?;
+    key.as_object_mut().unwrap().remove("aggregate");
+    Ok(key)
+}
+
+fn fusible(query: &Query) -> bool {
+    matches!(query.mode.as_str(), "archive" | "weather") && !query.raw
+        && query.scalar_args.is_none()
+        && matches!(query.aggregate.as_str(), "avg" | "min" | "max" | "sum" | "count"
+            | "not_null" | "mintime" | "maxtime" | "first" | "last" | "firsttime"
+            | "lasttime" | "cumulative" | "weighted_avg" | "integral")
+}
+
+struct SourceReduction {
+    query: Query,
+    requests: Vec<usize>,
+    projection: Vec<usize>,
+    stored: Option<usize>,
+    state: crate::window::WindowState,
+    bins: Vec<Reduction>,
+    units: Vec<Option<i64>>,
+}
+
+impl Store {
+    /// Fuse observations and basic reductions over identical archive intervals.
+    /// Daily, vector and exact percentile queries retain their specialized paths.
+    pub fn analytics_many(&mut self, queries: &[Query]) -> Result<BatchAnswer> {
+        ensure!(queries.len() <= 4096, "too many analytics requests");
+        let mut answer = BatchAnswer { answers: vec![Answer::default(); queries.len()], scans: 0, formula_evaluations: 0 };
+        let output_bytes = queries.iter().try_fold(0usize, |n,q| {
+            n.checked_add(q.ranges.len().saturating_mul(64)).context("batch workspace overflow")
+        })?;
+        ensure!(output_bytes <= self.workspace_bytes, "batch output workspace exceeded");
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (i,query) in queries.iter().enumerate() {
+            ensure!(matches!(query.source.as_str(), "" | "auto" | "stored" | "derived" | "fill_missing"), "unknown source policy");
+            for (start,stop) in &query.ranges { ensure!(start <= stop, "reversed analytics range"); }
+            ensure!(query.ranges.windows(2).all(|r|r[0].1 <= r[1].0) || matches!(query.mode.as_str(),"degree"|"historical"), "analytics ranges must be ordered and disjoint");
+            if query.ranges.is_empty() { continue; }
+            if !fusible(query) {
+                ensure!(query.raw || query.source.is_empty() || query.source == "auto", "source policy requires archive reductions");
+                answer.answers[i] = self.analytics(query)?;
+                answer.scans += 1;
+                continue;
+            }
+            if let Some(group) = groups.iter_mut().find(|g| {
+                let q = &queries[g[0]];
+                q.table == query.table && q.ranges == query.ranges
+                    && q.lower_inclusive == query.lower_inclusive && q.unit_system == query.unit_system
+            }) { group.push(i); } else { groups.push(vec![i]); }
+        }
+        for group in groups {
+            let per_source = queries[group[0]].ranges.len().checked_mul(std::mem::size_of::<Reduction>()+144).context("batch workspace overflow")?;
+            let capacity = self.workspace_bytes.saturating_sub(output_bytes)/per_source;
+            ensure!(capacity > 0, "batch reduction workspace exceeded");
+            let mut sources: Vec<(Json,Vec<usize>)> = Vec::new();
+            for i in group {
+                let key = source_key(&queries[i])?;
+                if let Some((_,requests)) = sources.iter_mut().find(|(k,_)| *k == key) {requests.push(i);}
+                else {sources.push((key,vec![i]));}
+            }
+            // Split observations, retaining all reductions of each source together.
+            // Small memory budgets still reuse expensive formulas across min/avg/max.
+            for chunk in sources.chunks(capacity) {
+                let requests: Vec<_> = chunk.iter().flat_map(|(_,indices)|indices.iter().copied()).collect();
+                self.fused_analytics(queries, &requests, output_bytes, &mut answer)?;
+            }
+        }
+        ensure!(answer.answers.iter().map(|a|a.values.len().saturating_mul(64)).sum::<usize>() <= self.workspace_bytes,"batch output workspace exceeded");
+        Ok(answer)
+    }
+
+    fn fused_analytics(&mut self, queries: &[Query], group: &[usize], output_bytes: usize, answer: &mut BatchAnswer) -> Result<()> {
+        let first = &queries[group[0]];
+        let mut names = vec!["usUnits".to_string(), "interval".to_string()];
+        let mut sources: Vec<SourceReduction> = Vec::new();
+        let mut keys: Vec<Json> = Vec::new();
+        for &i in group {
+            let query = &queries[i];
+            let key = source_key(query)?;
+            if let Some(index) = keys.iter().position(|k| *k == key) {
+                sources[index].requests.push(i);
+                continue;
+            }
+            let stored_only = query.source == "stored" || query.weather.is_none();
+            let inputs = if stored_only {vec![query.observation.clone()]} else {query.weather.as_ref().unwrap().inputs.clone()};
+            let mut project = |name: &String| {
+                if let Some(index) = names.iter().position(|n|n == name) {index}
+                else {names.push(name.clone()); names.len()-1}
+            };
+            let projection = inputs.iter().map(&mut project).collect();
+            let stored = (query.source == "fill_missing").then(||project(&query.observation));
+            let bytes = (sources.len()+1).checked_mul(first.ranges.len()).and_then(|n|n.checked_mul(std::mem::size_of::<Reduction>()+144)).context("batch workspace overflow")?;
+            ensure!(bytes <= self.workspace_bytes.saturating_sub(output_bytes), "batch reduction workspace exceeded");
+            sources.push(SourceReduction { query:query.clone(), requests:vec![i], projection, stored,
+                state:crate::window::WindowState::new(self,query)?, bins:vec![Reduction::default();first.ranges.len()], units:vec![None;first.ranges.len()] });
+            keys.push(key);
+        }
+        let columns = indices(self,&first.table,&names)?;
+        let schema = self.columns(&first.table)?;
+        for source in &sources {
+            if source.query.weather.is_none() || source.query.source == "stored" {
+                let ci = columns[source.projection[0]].context("unknown observation")?;
+                if schema[ci].kind == Kind::Integer {
+                    let stats = self.aggregate(&first.table,&source.query.observation,Span {start:first.ranges[0].0,stop:first.ranges.last().unwrap().1,daily:false})?;
+                    ensure!(![stats.min,stats.max,stats.sum].into_iter().flatten().any(|v|v.abs()>=(1_u64<<53)as f64), "integer precision requires SQL");
+                }
+            }
+        }
+        let mut values = vec![None;names.len()];
+        let mut args = Vec::new();
+        let mut unused_samples = 0;
+        let mut cursor = RowCursor::new_bounds(self,&first.table,Some((first.ranges[0].0,first.lower_inclusive)),Some((first.ranges.last().unwrap().1,true)))?;
+        answer.scans += 1;
+        while cursor.advance(self)? {
+            let Some(index) = destination(&first.ranges,cursor.time,false) else { continue };
+            numbers(self,&mut cursor,&columns,&mut values)?;
+            let unit = values[0].map(|v|v as i64);
+            for source in &mut sources {
+                let query = &source.query;
+                if query.weather.is_some() && query.source != "stored" {
+                    ensure!(unit == query.unit_system, "unit system changes within computed series");
+                }
+                source.units[index] = unit;
+                let value = if let Some(weather) = query.weather.as_ref().filter(|_|query.source != "stored") {
+                    args.clear(); args.extend(source.projection.iter().map(|&p|values[p]));
+                    // Stateful formulas must see every row, including rows with a stored
+                    // value, so a later NULL uses the same history as a derived series.
+                    let mut calculated = source.state.evaluate(self,weather,cursor.time,&args)?;
+                    answer.formula_evaluations += 1;
+                    if matches!(query.source.as_str(),"derived"|"fill_missing") {
+                        calculated = standard_value(calculated,&weather.formula,unit);
+                    }
+                    source.stored.and_then(|p|values[p]).or(calculated)
+                } else {values[source.projection[0]]};
+                source.bins[index].add(cursor.time,value,values[1].map(|v|v*60.0),"avg",None,&mut unused_samples)?;
+            }
+        }
+        for source in sources {
+            let state = source.state.finish();
+            for i in source.requests {
+                let query = &queries[i];
+                let mut result = Answer {rows:source.bins.iter().map(|b|b.rows).collect(), units:source.units.clone(), state:state.clone(), ..Answer::default()};
+                for bin in &source.bins {
+                    result.values.push(bin.finish(&query.aggregate,query.weather.is_some() && query.source != "stored",query.threshold)?);
+                }
+                if query.aggregate == "cumulative" {
+                    let mut sum = Accumulator::default();
+                    for value in &mut result.values { sum.add(value.as_f64()); *value = json!(sum.clone().finish().sum.unwrap_or(0.0)); }
+                }
+                answer.answers[i] = result;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn standard_value(value: Option<f64>, formula: &str, unit: Option<i64>) -> Option<f64> {
+    if unit == Some(1) { return value; }
+    match formula {
+        "ET" => value.map(|v|v*if unit == Some(17) {25.4} else {2.54}),
+        "pressure" => value.map(|v|v/0.0295299875),
+        _ => value,
+    }
 }

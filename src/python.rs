@@ -3,7 +3,7 @@ use crate::sql::{Session, cursor::Cursor};
 use crate::store::Store;
 use std::sync::Mutex;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyInt, PyFloat, PyString, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyInt, PyFloat, PyString, PyList, PyTuple, PyDict, PyBool};
 use pyo3::exceptions::PyValueError;
 use crate::computed::Computed;
 
@@ -123,6 +123,87 @@ impl PyConnection {
         Ok((starts,stops,list.into_any().unbind()))
     }
 
+    fn packet_native(&self, py: Python<'_>, table: String, record: &Bound<'_,PyAny>, specifications: &Bound<'_,PyAny>) -> PyResult<Py<PyAny>> {
+        let mut record = python_json(record,0)?;
+        let specifications: Vec<(String,crate::weather::WeatherSpec)> = serde_json::from_value(python_json(specifications,0)?).map_err(py_error)?;
+        let result = py.detach(|| -> Result<_> {
+            let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
+            session.refresh()?;
+            let mut store = crate::sql::guard(&session.store)?;
+            let units = record["usUnits"].as_i64().context("packet unit system missing")?;
+            let time = record["dateTime"].as_f64().context("packet timestamp missing")?;
+            let mut results = Vec::new();
+            for (observation, weather) in specifications {
+                if weather.inputs.iter().any(|name|record.get(name).is_none()) {
+                    let status = if matches!(observation.as_str(),"windDir"|"windGustDir") {"no_calculate"} else {"cannot_calculate"};
+                    if status == "cannot_calculate" { record[&observation] = serde_json::Value::Null; }
+                    results.push(serde_json::json!({"observation":observation,"status":status}));
+                    continue;
+                }
+                let args: Vec<_> = weather.inputs.iter().map(|name|record[name].as_f64()).collect();
+                let query: crate::analytics::Query = serde_json::from_value(serde_json::json!({
+                    "table":table,"mode":"weather","observation":observation,"aggregate":"avg",
+                    "ranges":[[time.floor() as i64,time.floor() as i64]],"weather":weather,"scalar_args":args
+                }))?;
+                let answer = match store.analytics(&query) {
+                    Ok(answer) => answer,
+                    Err(error) if error.to_string() == "no calculate" => {
+                        results.push(serde_json::json!({"observation":observation,"status":"no_calculate"}));
+                        continue;
+                    },
+                    Err(error) => return Err(error),
+                };
+                let mut value = answer.values[0].as_f64();
+                let rain_scale = |u|if u == 1 {1.0} else if u == 17 {25.4} else {2.54};
+                if observation == "ET" { value = value.map(|v|v*rain_scale(units)); }
+                if observation == "pressure" && units != 1 { value = value.map(|v|v/0.0295299875); }
+                if observation == "rainRate" {
+                    let source_units = answer.state["rain_units"].as_i64().unwrap_or(units);
+                    value = value.map(|v|v*rain_scale(units)/rain_scale(source_units));
+                }
+                record[&observation] = serde_json::json!(value);
+                results.push(serde_json::json!({"observation":observation,"status":"calculated","value":value,"state":answer.state}));
+            }
+            Ok(serde_json::Value::Array(results))
+        }).map_err(py_error)?;
+        json_python(py,&result)
+    }
+
+    fn analytics_native(&self, py: Python<'_>, specification: &Bound<'_,PyAny>) -> PyResult<Py<PyAny>> {
+        let query = serde_json::from_value(python_json(specification,0)?).map_err(py_error)?;
+        let answer = py.detach(|| -> Result<_> {
+            let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
+            session.refresh()?;
+            crate::sql::guard(&session.store)?.analytics(&query)
+        }).map_err(py_error)?;
+        answer_python(py,&answer)
+    }
+
+    fn analytics_many_native(&self, py: Python<'_>, specifications: &Bound<'_,PyAny>) -> PyResult<Py<PyAny>> {
+        let queries: Vec<crate::analytics::Query> = serde_json::from_value(python_json(specifications,0)?).map_err(py_error)?;
+        let answer = py.detach(|| -> Result<_> {
+            let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
+            session.refresh()?;
+            crate::sql::guard(&session.store)?.analytics_many(&queries)
+        }).map_err(py_error)?;
+        let dict = PyDict::new(py);
+        let answers = PyList::new(py,answer.answers.iter().map(|a|answer_python(py,a)).collect::<PyResult<Vec<_>>>()?)?;
+        dict.set_item("answers",answers)?;
+        dict.set_item("scans",answer.scans)?;
+        dict.set_item("formula_evaluations",answer.formula_evaluations)?;
+        Ok(dict.into_any().unbind())
+    }
+
+    fn revision(&self, py: Python<'_>) -> PyResult<Option<(String,u64)>> {
+        py.detach(|| -> Result<_> {
+            let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
+            session.refresh()?;
+            if session.in_transaction() { return Ok(None); }
+            let store = crate::sql::guard(&session.store)?;
+            Ok(Some((store.snapshot.manifest.id.clone(),store.lsn())))
+        }).map_err(py_error)
+    }
+
     fn analytics(&self, py: Python<'_>, specification: String) -> PyResult<String> {
         let query: crate::analytics::Query = serde_json::from_str(&specification).map_err(py_error)?;
         py.detach(|| -> Result<String> {
@@ -191,6 +272,65 @@ fn to_python(py: Python<'_>, value: &Cell) -> PyResult<Py<PyAny>> {
     })
 }
 
+fn answer_python(py: Python<'_>, answer: &crate::analytics::Answer) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    let values = PyList::new(py,answer.values.iter().map(|v|json_python(py,v)).collect::<PyResult<Vec<_>>>()?)?;
+    dict.set_item("values",values)?;
+    dict.set_item("rows",&answer.rows)?;
+    dict.set_item("units",&answer.units)?;
+    dict.set_item("starts",&answer.starts)?;
+    dict.set_item("stops",&answer.stops)?;
+    dict.set_item("state",json_python(py,&answer.state)?)?;
+    Ok(dict.into_any().unbind())
+}
+
+fn python_json(value: &Bound<'_,PyAny>, depth: usize) -> PyResult<serde_json::Value> {
+    use serde_json::Value as J;
+    if depth > 32 { return Err(py_error("native request nesting exceeded")); }
+    Ok(if value.is_none() { J::Null }
+        else if value.is_instance_of::<PyBool>() { J::Bool(value.extract()?) }
+        else if value.is_instance_of::<PyInt>() { J::from(value.extract::<i64>()?) }
+        else if value.is_instance_of::<PyFloat>() {
+            J::Number(serde_json::Number::from_f64(value.extract()?).ok_or_else(||py_error("non-finite request number"))?)
+        } else if value.is_instance_of::<PyString>() { J::String(value.extract()?) }
+        else if let Ok(dict) = value.cast::<PyDict>() {
+            let mut result = serde_json::Map::new();
+            for (key,item) in dict.iter() { result.insert(key.extract()?,python_json(&item,depth+1)?); }
+            J::Object(result)
+        } else if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+            J::Array(value.try_iter()?.map(|v|python_json(&v?,depth+1)).collect::<PyResult<_>>()?)
+        } else { return Err(py_error("unsupported native request value")); })
+}
+
+fn json_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
+    use serde_json::Value as J;
+    Ok(match value {
+        J::Null => py.None(),
+        J::Bool(v) => v.into_pyobject(py)?.to_owned().into_any().unbind(),
+        J::Number(v) => {
+            if let Some(n) = v.as_i64() {n.into_pyobject(py)?.into_any().unbind()}
+            else if let Some(n) = v.as_u64() {n.into_pyobject(py)?.into_any().unbind()}
+            else {v.as_f64().unwrap().into_pyobject(py)?.into_any().unbind()}
+        },
+        J::String(v) => v.into_pyobject(py)?.into_any().unbind(),
+        J::Array(values) => {
+            PyList::new(py,values.iter().map(|v|json_python(py,v)).collect::<PyResult<Vec<_>>>()?)?.into_any().unbind()
+        },
+        J::Object(values) => {
+            let dict = PyDict::new(py);
+            for (k,v) in values { dict.set_item(k,json_python(py,v)?)?; }
+            dict.into_any().unbind()
+        },
+    })
+}
+
+#[pyfunction]
+fn astronomy_native(py:Python<'_>,specification:&Bound<'_,PyAny>)->PyResult<Py<PyAny>> {
+    let request = serde_json::from_value(python_json(specification,0)?).map_err(py_error)?;
+    let result = py.detach(||crate::astro::execute(&request)).map_err(py_error)?;
+    json_python(py,&result)
+}
+
 #[pyfunction]
 fn create(py: Python<'_>, path: String) -> PyResult<()> { py.detach(||Store::create(Path::new(&path),"archive")).map_err(py_error) }
 
@@ -210,5 +350,6 @@ fn _weewxdb(module: &Bound<'_,PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(create,module)?)?;
     module.add_function(wrap_pyfunction!(drop_database,module)?)?;
     module.add_function(wrap_pyfunction!(astronomy,module)?)?;
+    module.add_function(wrap_pyfunction!(astronomy_native,module)?)?;
     Ok(())
 }

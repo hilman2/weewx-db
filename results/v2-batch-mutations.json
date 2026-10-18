@@ -1,0 +1,31 @@
+[
+  {
+    "mutation": "source policy",
+    "test": "tests/test_batch.py::test_existing_columns_and_nulls_respect_source_policy",
+    "returncode": 1,
+    "failure": "E           assert 999.0 == 87.16818851827986 \u00b1 8.7e-09\nE             \nE             comparison failed\nE             Obtained: 999.0\nE             Expected: 87.16818851827986 \u00b1 8.7e-09\n\ntests/test_all_xtypes.py:60: AssertionError"
+  },
+  {
+    "mutation": "cache invalidation",
+    "test": "tests/test_batch.py::test_cache_tracks_corrections_other_connections_and_transactions",
+    "returncode": 1,
+    "failure": "E           AssertionError: assert [(([1704067200, 1704074400, 1704081600], 'unix_epoch', 'group_time'), ([1704074400, 1704081600, 1704085200], 'unix_epo...x_epoch', 'group_time'), ([19.044825366840296, 33.1555209027361, 36.15947667641331], 'degree_C', 'group_temperature'))] != [(([1704067200, 1704074400, 1704081600], 'unix_epoch', 'group_time'), ([1704074400, 1704081600, 1704085200], 'unix_epo...x_epoch', 'group_time'), ([19.044825366840296, 33.1555209027361, 36.15947667641331], 'degree_C', 'group_temperature'))]\n\ntests/test_batch.py:86: AssertionError"
+  },
+  {
+    "mutation": "JSON NULL sensor policy",
+    "test": "tests/test_json_extension.py::test_derived_all_null_column_is_not_skipped",
+    "returncode": 1,
+    "failure": "E           assert []\n\ntests/test_json_extension.py:70: AssertionError"
+  },
+  {
+    "mutation": "Retain aggregate in shared formula key",
+    "test": "tests/test_batch.py::test_batch_matches_independent_weewx_queries_one_scan",
+    "failure": "E           AssertionError: assert {'scans': 1, ...uations': 900} == {'scans': 1, ...uations': 300}\nE             \nE             Omitting 1 identical items, use -vv to show\nE             Differing items:\nE             {'formula_evaluations': 900} != {'formula_evaluations': 300}\nE             Use -v to get more diff\n\ntests/test_batch.py:37: AssertionError"
+  },
+  {
+    "mutation": "Rebuild calendar intervals for each aggregate",
+    "test": "tests/test_json_extension.py::test_incremental_resume_calendar_is_reused",
+    "returncode": 1,
+    "failure": "E           assert 6 == 1\nE            +  where 6 = max(dict_values([2, 6, 6]))\nE            +    where dict_values([2, 6, 6]) = <built-in method values of Counter object at 0x73ca17367160>()\nE            +      where <built-in method values of Counter object at 0x73ca17367160> = Counter({(1704069000, 1704338100, 900): 6, (1704067200, 1704340800, 3600): 6, (1704322800, 1704339000, 1800): 2}).values\n\ntests/test_json_extension.py:114: AssertionError"
+  }
+]

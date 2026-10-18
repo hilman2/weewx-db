@@ -1,0 +1,56 @@
+{
+  "execution": {
+    "cpu_affinity": [
+      6
+    ],
+    "cpu_max_frequency_khz": "3351352",
+    "smt_siblings": "6,18",
+    "thread_affinities": {
+      "2861389": [
+        6
+      ]
+    }
+  },
+  "rounds": 3,
+  "observations": [
+    "ET",
+    "appTemp",
+    "windchill"
+  ],
+  "aggregates": [
+    "avg",
+    "min",
+    "max"
+  ],
+  "interval_seconds": 3600,
+  "span": [
+    1987891200,
+    2019427200
+  ],
+  "cache_mib": 32,
+  "workspace_mib": 32,
+  "sqlite_samples_ms": [
+    11562.702137,
+    11509.007334,
+    11405.439553
+  ],
+  "rust_separate_samples_ms": [
+    617.460695,
+    610.186203,
+    606.09903
+  ],
+  "rust_batch_samples_ms": [
+    330.423593,
+    327.546066,
+    325.724886
+  ],
+  "sqlite_median_ms": 11509.007334,
+  "rust_separate_median_ms": 610.186203,
+  "rust_batch_median_ms": 327.546066,
+  "batch_counters": {
+    "scans": 1,
+    "formula_evaluations": 315360
+  },
+  "verified": true,
+  "note": "Warm OS cache. Numeric tolerance 1e-10 relative / 1e-9 absolute. Not a Raspberry Pi measurement."
+}
