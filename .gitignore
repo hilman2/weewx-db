@@ -2,3 +2,17 @@
 /python/weewxdb/*.so
 /python/weewxdb/*.pyd
 /python/weewxdb/*.dylib
+/build/
+/.venv/
+/.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+/dist/
+/wheels/
+.env
+.env.*
+*.sdb
+*.sdb-*
+*.wwdb
+*.wwdb.*

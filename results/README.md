@@ -1,5 +1,8 @@
 # Desktop measurements, 18 October 2026
 
+The raw reports retain paths from the original WeeWX working tree. Commands
+on this page use the standalone repository layout.
+
 These measurements use a synthetic ten-year archive with 1,051,200
 five-minute records, 32 observation columns and 16 active sensors. The host
 is Linux x86_64 on an AMD Ryzen AI 9 HX 470 with NVMe storage, Rust 1.99.0
@@ -70,7 +73,7 @@ Reproduce the pinned run after the setup below:
 
 ```sh
 taskset -c 6 env PYTHONPATH=build/weewx-db-trial/json-source/src python3 \
-    experimental/weewx-db/tools/bench_json.py build/weather.sdb build/weather.wwdb \
+    tools/bench_json.py build/weather.sdb build/weather.wwdb \
     --cache-mib 128 --workspace-mib 256 --rounds 7 --source-ref 28ac6ab8
 ```
 
@@ -153,11 +156,11 @@ with sqlite3.connect(sys.argv[1]) as connection:
                        'CASE WHEN ((dateTime-1704067200)/300)%41=0 THEN NULL '
                        'ELSE 60+35*sin(dateTime/18000.0) END')
 PY
-experimental/weewx-db/target/release/weewx-db import build/computed.sdb build/computed.wwdb
-taskset -c 6 env PYTHONPATH=src python3 experimental/weewx-db/tools/bench_computed.py \
+target/release/weewx-db import build/computed.sdb build/computed.wwdb
+taskset -c 6 env PYTHONPATH=build/weewx-db-trial/weewx-source/src python3 tools/bench_computed.py \
     build/computed.sdb build/computed.wwdb --rounds 3 --cache-mib 128 --workspace-mib 256
 taskset -c 6 env PYTHONPATH=build/weewx-db-trial/json-source/src python3 \
-    experimental/weewx-db/tools/bench_json.py build/computed.sdb build/computed.wwdb \
+    tools/bench_json.py build/computed.sdb build/computed.wwdb \
     --computed --rounds 3 --cache-mib 128 --workspace-mib 256 --source-ref 28ac6ab8
 ```
 
@@ -232,12 +235,12 @@ with sqlite3.connect(sys.argv[1]) as connection:
                        'radiation=MAX(0,700*sin((dateTime%86400-21600)/86400.0*6.283185307179586)),'
                        'windDir=ABS((dateTime/300)%360)')
 PY
-experimental/weewx-db/target/release/weewx-db import \
+target/release/weewx-db import \
     build/weewx-db-trial/complex.sdb build/weewx-db-trial/complex.wwdb
-taskset -c 6 env PYTHONPATH=src python3 experimental/weewx-db/tools/bench_xtypes.py \
+taskset -c 6 env PYTHONPATH=build/weewx-db-trial/weewx-source/src python3 tools/bench_xtypes.py \
     build/weewx-db-trial/complex.sdb build/weewx-db-trial/complex.wwdb --rounds 3
 taskset -c 6 env PYTHONPATH=build/weewx-db-trial/json-source/src python3 \
-    experimental/weewx-db/tools/bench_json.py \
+    tools/bench_json.py \
     build/weewx-db-trial/complex.sdb build/weewx-db-trial/complex.wwdb \
     --observations ET,appTemp,windchill --cache-mib 128 --workspace-mib 256 \
     --rounds 3 --source-ref 28ac6ab8
@@ -327,20 +330,19 @@ latency at station intervals; it does not improve report generation.
 
 ## Reproduce
 
-From the repository root, with the optional Python package and WeeWX test
-dependencies installed:
+From this repository root, after the development setup in
+[README.md](../README.md):
 
 ```sh
-cargo build --release --locked --manifest-path experimental/weewx-db/Cargo.toml
-mkdir -p build/weewx-db-trial/json-source
-git archive 28ac6ab8 src | tar -x -C build/weewx-db-trial/json-source
-experimental/weewx-db/target/release/weewx-db fixture build/weather.sdb
-experimental/weewx-db/target/release/weewx-db import build/weather.sdb build/weather.wwdb
+cargo build --release --locked
+python3 tools/fetch_references.py
+target/release/weewx-db fixture build/weather.sdb
+target/release/weewx-db import build/weather.sdb build/weather.wwdb
 PYTHONPATH=build/weewx-db-trial/json-source/src python3 \
-    experimental/weewx-db/tools/bench_json.py build/weather.sdb build/weather.wwdb \
+    tools/bench_json.py build/weather.sdb build/weather.wwdb \
     --cache-mib 128 --workspace-mib 256 --rounds 7 --source-ref 28ac6ab8
 PYTHONPATH=build/weewx-db-trial/json-source/src python3 \
-    experimental/weewx-db/tools/bench_native.py build/weather.sdb build/weather.wwdb \
+    tools/bench_native.py build/weather.sdb build/weather.wwdb \
     --cache-mib 128 --workspace-mib 256 --rounds 7
 ```
 

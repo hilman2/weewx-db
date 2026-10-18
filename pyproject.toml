@@ -7,7 +7,12 @@ name = "weewx-db"
 version = "0.2.0"
 requires-python = ">=3.9"
 description = "Rust column store, SQL connection and optional WeeWX driver"
+readme = "README.md"
 license = "GPL-3.0-only"
+
+[project.urls]
+Repository = "https://github.com/hilman2/weewx-db"
+Documentation = "https://github.com/hilman2/weewx-db/blob/main/README.md"
 
 [tool.maturin]
 python-source = "python"

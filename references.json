@@ -1,0 +1,18 @@
+{
+  "weewx-source": {
+    "repository": "https://github.com/hilman2/weewx.git",
+    "revision": "def717274ef07da1910f9a0975f8d76ed287aa47"
+  },
+  "json-source": {
+    "repository": "https://github.com/hilman2/weewx.git",
+    "revision": "28ac6ab8691bc10882b21ce5486f1dc0df200daf"
+  },
+  "xaggs-source": {
+    "repository": "https://github.com/tkeffer/weewx-xaggs.git",
+    "revision": "d36145689b6d4bd363a792432df94215d69f5026"
+  },
+  "ephem-source": {
+    "repository": "https://github.com/brandon-rhodes/pyephem.git",
+    "revision": "6be1e55540fd32aaeff272733190128155e8a35c"
+  }
+}

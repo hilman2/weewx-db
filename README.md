@@ -1,10 +1,14 @@
-# WeeWX database experiment
+# WeeWX database
 
 This optional Rust backend stores WeeWX archive records and daily summaries
 in its own format. It provides a weedb driver, a Python DB-API connection,
 SQL queries and a pipeline CLI. Time-series calculations run in Rust through
 an XType provider. The existing WeeWX installation stays on SQLite until you
 select the new driver.
+
+This repository preserves the database experiment originally developed inside
+the WeeWX checkout. [Source provenance and licenses](NOTICE.md) identify the
+upstream references and the original snapshot.
 
 The backend is experimental. Read the [supported operations and limits](reference.md)
 before switching an installation. [Recorded measurements](results/README.md)
@@ -18,12 +22,12 @@ your WeeWX installation when installing the optional driver.
 ```sh
 cargo build --release --locked
 python3 -m pip install .
-mkdir -p ../../build/weewx-db-trial
-target/release/weewx-db fixture ../../build/weewx-db-trial/weather.sdb
-target/release/weewx-db import ../../build/weewx-db-trial/weather.sdb \
-    ../../build/weewx-db-trial/weather.wwdb
-target/release/weewx-db bench ../../build/weewx-db-trial/weather.sdb \
-    ../../build/weewx-db-trial/weather.wwdb --cache-mib 32 --rounds 9
+mkdir -p build/weewx-db-trial
+target/release/weewx-db fixture build/weewx-db-trial/weather.sdb
+target/release/weewx-db import build/weewx-db-trial/weather.sdb \
+    build/weewx-db-trial/weather.wwdb
+target/release/weewx-db bench build/weewx-db-trial/weather.sdb \
+    build/weewx-db-trial/weather.wwdb --cache-mib 32 --rounds 9
 ```
 
 To test an existing archive, import its SQLite file instead of generating
@@ -148,20 +152,33 @@ target/release/weewx-db check weather.wwdb
 target/release/weewx-db info weather.wwdb
 target/release/weewx-db checkpoint weather.wwdb --optimize
 target/release/weewx-db vacuum weather.wwdb
-cargo test --locked
-cargo clippy --all-targets --features python --locked -- -D warnings
-PYTHONPATH=../../src python3 -m pytest tests
-```
-
-Differential astronomy tests use `ephem==4.2.1` as an independent reference.
-Install it in the test environment. Fetch the xaggs reference to run its
-comparison tests:
-
-```sh
-git clone https://github.com/tkeffer/weewx-xaggs ../../build/weewx-db-trial/xaggs-source
-git -C ../../build/weewx-db-trial/xaggs-source checkout d36145689b6d4bd363a792432df94215d69f5026
 ```
 
 Checkpoint updates affected blocks and their summaries. Vacuum reclaims
 obsolete blocks. The [storage explanation](architecture.md) describes the
 journal, automatic indices, synchronization and backup files.
+
+## Run the development checks
+
+Tests use pinned public WeeWX, JSON-generator, xaggs and PyEphem reference
+sources listed in [references.json](references.json). Python 3.13 and Rust 1.99
+were used for the recorded checks. Install a Rust toolchain, Python and Git,
+then run from a fresh clone:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-test.txt
+python -m pip install -e .
+python tools/fetch_references.py
+cargo test --locked --tests
+cargo clippy --all-targets --features python --locked -- -D warnings
+cargo build --release --locked
+PYTHONPATH=build/weewx-db-trial/weewx-source/src python -m pytest -q tests
+PYTHONPATH=build/weewx-db-trial/json-source/src python -m pytest -q tests
+```
+
+The reference fetcher verifies existing checkouts before reusing them. Database
+fixtures are synthetic and generated locally; the repository contains the
+measurement reports and reproduction tools. See [results/README.md](results/README.md)
+to reproduce the performance comparisons.

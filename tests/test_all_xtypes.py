@@ -206,7 +206,7 @@ def test_every_wind_vector_aggregate(daily_pair, monkeypatch, observation, aggre
 
 @pytest.fixture
 def xaggs(monkeypatch):
-    path = pathlib.Path(__file__).resolve().parents[3] / 'build/weewx-db-trial/xaggs-source/bin/user/xaggs.py'
+    path = pathlib.Path(__file__).resolve().parents[1] / 'build/weewx-db-trial/xaggs-source/bin/user/xaggs.py'
     if not path.is_file():
         pytest.skip('Fetch the pinned weewx-xaggs reference for differential tests')
     spec = importlib.util.spec_from_file_location('reference_xaggs', path)

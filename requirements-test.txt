@@ -1,0 +1,4 @@
+pytest==9.1.1
+configobj==5.0.9
+Pillow==13.0.0
+ephem @ git+https://github.com/brandon-rhodes/pyephem.git@6be1e55540fd32aaeff272733190128155e8a35c
