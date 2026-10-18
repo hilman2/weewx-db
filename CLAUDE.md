@@ -30,3 +30,14 @@ Keep the existing style. Do not run automatic formatters over unrelated code.
 Python adapters follow WeeWX's conventions. Documentation is in English.
 Preserve upstream notices and pinned numerical references when editing astronomy.
 Keep generated databases, credentials, virtual environments and build products out of Git.
+
+## Release builds
+
+The GitHub Actions release matrix covers Linux x86_64, ARM64, ARMv7 and both
+macOS architectures. It runs on manual dispatch or a deliberate `v*` tag, never
+on ordinary branch pushes or pull requests. Tag builds prepare a draft release.
+Do not create or push release tags unless the user explicitly requests it.
+
+- `python3 tools/build_extension.py` builds a native extension archive.
+- `python3 tools/build_extension.py --target TRIPLE --glibc 2.17` builds a portable Linux archive with cargo-zigbuild.
+- `python3 tools/check_extension.py ARCHIVE.zip` checks a built archive in a fresh interpreter.

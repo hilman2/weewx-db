@@ -3,6 +3,7 @@
 import importlib.util
 import os
 import platform
+import struct
 from pathlib import Path
 
 from weecfg.extension import ExtensionInstaller, InstallError
@@ -20,7 +21,13 @@ class WeeWXDBInstaller(ExtensionInstaller):
     def __init__(self):
         native = Path(__file__).parent / 'bin/user/weewxdb/_weewxdb.abi3.so'
         if native.is_file():
-            if (platform.system(), platform.machine()) != PLATFORM:
+            machine = platform.machine()
+            # A 64-bit ARM kernel can run a 32-bit Raspberry Pi userspace.
+            # The extension must match the interpreter's pointer width.
+            if platform.system() == 'Linux' and machine in ['aarch64', 'arm64', 'armv8l'] \
+                    and struct.calcsize('P') == 4:
+                machine = 'armv7l'
+            if (platform.system(), machine) != PLATFORM:
                 raise InstallError('This archive is for %s %s; build an archive on the target system.' % PLATFORM)
             try:
                 spec = importlib.util.spec_from_file_location('_weewxdb', native)

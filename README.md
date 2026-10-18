@@ -17,7 +17,7 @@ include SQLite comparisons through the drivers and the JSON generator.
 ## Install as a WeeWX extension
 
 The [extension guide](extension.md) covers building and installing the complete
-package, SQLite migration, and enabling the JSON and packet adapters. It bundles
+package, downloading CI builds, SQLite migration, and enabling the JSON and packet adapters. It bundles
 the Rust module and SQL CLI for the target platform. The JSON adapter uses the
 generator supplied by WeeWX 5.6. [Batch API reference](batch.md) documents joint
 queries, source policies and the bounded report cache.

@@ -1,0 +1,139 @@
+name: Build release packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            docker_platform: linux/amd64
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            docker_platform: linux/arm64
+          - target: armv7-unknown-linux-gnueabihf
+            runner: ubuntu-24.04
+            docker_platform: linux/arm/v7
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Check package and tag versions
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          assert version == tomllib.loads(Path('pyproject.toml').read_text())['project']['version']
+          if os.environ['REF_TYPE'] == 'tag':
+              assert os.environ['REF_NAME'] == 'v' + version, 'Tag must match package version'
+          PY
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add '${{ matrix.target }}'
+      - name: Build portable Linux archive
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install cargo-zigbuild
+          python tools/build_extension.py --target '${{ matrix.target }}' --glibc 2.17
+      - name: Build macOS archive
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target == 'aarch64-apple-darwin' && '11.0' || '10.13' }}
+        run: python tools/build_extension.py --target '${{ matrix.target }}'
+      - name: Enable ARMv7 runtime checks
+        if: matrix.target == 'armv7-unknown-linux-gnueabihf'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+      - name: Check Linux archives on Python 3.9 and 3.13
+        if: runner.os == 'Linux'
+        env:
+          DOCKER_PLATFORM: ${{ matrix.docker_platform }}
+        run: |
+          for python_version in 3.9 3.13; do
+            docker run --rm --platform "$DOCKER_PLATFORM" \
+              -v "$PWD:/work:ro" -w /work "python:${python_version}-slim-bullseye" \
+              sh -c 'python tools/check_extension.py dist/*.zip'
+          done
+      - uses: actions/setup-python@v7
+        if: runner.os == 'macOS'
+        with:
+          python-version: '3.9'
+      - name: Check macOS archive on Python 3.9
+        if: runner.os == 'macOS'
+        run: python tools/check_extension.py dist/*.zip
+      - uses: actions/setup-python@v7
+        if: runner.os == 'macOS'
+        with:
+          python-version: '3.13'
+      - name: Check macOS archive on Python 3.13
+        if: runner.os == 'macOS'
+        run: python tools/check_extension.py dist/*.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: weewx-db-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  draft:
+    name: Prepare draft release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: weewx-db-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and collect checksums
+        run: |
+          cd dist
+          cat -- ./*.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Attach packages to draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' > release-state; then
+            test "$(cat release-state)" = true
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "WeeWX database $RELEASE_TAG" \
+              --notes 'Experimental WeeWX database. Installation: https://github.com/hilman2/weewx-db/blob/main/extension.md'
+          fi
+          gh release upload "$RELEASE_TAG" dist/*.zip dist/SHA256SUMS --clobber

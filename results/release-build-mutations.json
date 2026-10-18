@@ -1,0 +1,17 @@
+[
+  {
+    "mutation": "wrong pointer width",
+    "test": "tests/test_release_build.py::test_wrong_linux_architecture_rejected",
+    "failure": "E       Failed: DID NOT RAISE ValueError\n\ntests/test_release_build.py:59: Failed"
+  },
+  {
+    "mutation": "glibc ceiling",
+    "test": "tests/test_release_build.py::test_glibc_ceiling_checks_the_actual_binary",
+    "failure": "E       Failed: DID NOT RAISE ValueError\n\ntests/test_release_build.py:67: Failed"
+  },
+  {
+    "mutation": "host metadata on cross build",
+    "test": "tests/test_release_build.py::test_foreign_archive_uses_target_paths_and_metadata",
+    "failure": "E           AssertionError: assert 'x86_64' == 'armv7l'\nE             \nE             - armv7l\nE             + x86_64\n\ntests/test_release_build.py:48: AssertionError"
+  }
+]
