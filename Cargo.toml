@@ -1,0 +1,28 @@
+[package]
+name = "weewx-db"
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Transactional column store and SQL engine for WeeWX"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+python = ["dep:pyo3"]
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
+rusqlite = { version = "0.40", features = ["bundled", "cache", "vtab", "functions", "window"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+fs2 = "0.4"
+getrandom = "0.4"
+lz4_flex = { version = "0.12", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+sqlparser = { version = "0.61", default-features = false, features = ["std"] }
+pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
+

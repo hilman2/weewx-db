@@ -1,0 +1,60 @@
+{
+  "platform": "linux-x86_64",
+  "sqlite_version": "3.53.2",
+  "source": "build/weewx-db-trial/ten-years.sdb",
+  "database": "build/weewx-db-trial/ten-years.wwdb",
+  "archive_rows": 1051200,
+  "source_bytes": 177381376,
+  "database_bytes": 163026223,
+  "cache_limit_bytes_per_engine": 0,
+  "custom_cache_resident_bytes": 0,
+  "rounds": 9,
+  "cache_note": "First queries use new connections and empty engine caches. OS caches are not cleared. Medians follow one warmup; engine order alternates. Cache budgets exclude indices, results, SQLite overhead and OS cache. SQLite statements are cached and mmap is disabled. Read-only microbenchmark, not report or durable write throughput.",
+  "cases": [
+    {
+      "workload": "raw_day",
+      "first_sqlite_ms": 0.055340999999999994,
+      "first_weewxdb_ms": 0.009978,
+      "sqlite_median_ms": 0.020668,
+      "weewxdb_median_ms": 0.004638000000000001,
+      "speedup": 4.4562311341095295,
+      "verified_answers": 11
+    },
+    {
+      "workload": "raw_month",
+      "first_sqlite_ms": 0.607919,
+      "first_weewxdb_ms": 0.063055,
+      "sqlite_median_ms": 0.5783550000000001,
+      "weewxdb_median_ms": 0.056924,
+      "speedup": 10.16012578174408,
+      "verified_answers": 11
+    },
+    {
+      "workload": "hourly_year",
+      "first_sqlite_ms": 19.832221,
+      "first_weewxdb_ms": 0.848036,
+      "sqlite_median_ms": 19.323413000000002,
+      "weewxdb_median_ms": 0.816089,
+      "speedup": 23.678070651607854,
+      "verified_answers": 11
+    },
+    {
+      "workload": "raw_entire_archive",
+      "first_sqlite_ms": 75.36674000000001,
+      "first_weewxdb_ms": 7.150081,
+      "sqlite_median_ms": 73.39470200000001,
+      "weewxdb_median_ms": 6.876112,
+      "speedup": 10.673866568781895,
+      "verified_answers": 11
+    },
+    {
+      "workload": "stored_daily_year_mean",
+      "first_sqlite_ms": 0.042999,
+      "first_weewxdb_ms": 0.020297,
+      "sqlite_median_ms": 0.015478,
+      "weewxdb_median_ms": 0.012221999999999998,
+      "speedup": 1.2664048437244315,
+      "verified_answers": 11
+    }
+  ]
+}

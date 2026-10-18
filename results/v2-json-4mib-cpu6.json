@@ -1,0 +1,96 @@
+{
+  "generator_ref": "28ac6ab8",
+  "generator_source": "/home/hilman2/.t3/worktrees/weewx/t3-92c12c8d/build/weewx-db-trial/json-source/src/weewx/jsongenerator.py",
+  "execution": {
+    "cpu_affinity": [
+      6
+    ],
+    "cpu_max_frequency_khz": "3351352",
+    "smt_siblings": "6,18",
+    "thread_affinities": {
+      "1026743": [
+        6
+      ]
+    }
+  },
+  "cache_mib": 4,
+  "workspace_mib": 16,
+  "rounds": 7,
+  "json_files": 56,
+  "json_bytes": 664499,
+  "cases": [
+    {
+      "workload": "rebuild",
+      "sqlite_median_ms": 1105.932933,
+      "weewxdb_median_ms": 478.091126,
+      "speedup": 2.313226230013732,
+      "sqlite_samples_ms": [
+        1202.678824,
+        1084.885187,
+        1116.049734,
+        1089.073632,
+        1105.932933,
+        1123.751016,
+        1099.552572
+      ],
+      "weewxdb_samples_ms": [
+        465.424507,
+        482.500965,
+        500.993174,
+        472.478807,
+        482.425027,
+        478.091126,
+        475.099393
+      ]
+    },
+    {
+      "workload": "incremental",
+      "sqlite_median_ms": 45.927528,
+      "weewxdb_median_ms": 47.485728,
+      "speedup": 0.9671859300546051,
+      "sqlite_samples_ms": [
+        45.594911,
+        47.330546,
+        46.783228,
+        45.927528,
+        45.951792,
+        45.14469,
+        45.924441
+      ],
+      "weewxdb_samples_ms": [
+        47.485728,
+        48.570906,
+        47.452207,
+        48.414,
+        45.618875,
+        47.623669,
+        45.45761
+      ]
+    },
+    {
+      "workload": "idle",
+      "sqlite_median_ms": 2.892843,
+      "weewxdb_median_ms": 2.529902,
+      "speedup": 1.1434604976793568,
+      "sqlite_samples_ms": [
+        57.825796,
+        1.60194,
+        54.232437,
+        2.149339,
+        2.892843,
+        2.480051,
+        44.21807
+      ],
+      "weewxdb_samples_ms": [
+        2.493064,
+        13.629274,
+        2.427746,
+        26.415089,
+        1.703656,
+        34.507417,
+        2.529902
+      ]
+    }
+  ],
+  "note": "Complete JSONGenerator.start timings include database access, unit conversion and file serialization. All parsed JSON outputs match exactly after removing index.rebuilt. Three sensors, ten-year fixture, UTC, warm OS cache; not a Raspberry Pi measurement."
+}

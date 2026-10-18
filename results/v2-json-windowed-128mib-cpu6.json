@@ -1,0 +1,77 @@
+{
+  "generator_ref": "28ac6ab8",
+  "generator_source": "/home/hilman2/.t3/worktrees/weewx/t3-92c12c8d/build/weewx-db-trial/json-source/src/weewx/jsongenerator.py",
+  "execution": {
+    "cpu_affinity": [
+      6
+    ],
+    "cpu_max_frequency_khz": "3351352",
+    "smt_siblings": "6,18",
+    "thread_affinities": {
+      "1950038": [
+        6
+      ]
+    }
+  },
+  "cache_mib": 128,
+  "workspace_mib": 256,
+  "rounds": 3,
+  "json_files": 56,
+  "json_bytes": 687599,
+  "computed_observations": [
+    "ET",
+    "appTemp",
+    "windchill"
+  ],
+  "cases": [
+    {
+      "workload": "rebuild",
+      "sqlite_median_ms": 40959.801025,
+      "weewxdb_median_ms": 3008.133064,
+      "speedup": 13.616352785449786,
+      "sqlite_samples_ms": [
+        35935.239506,
+        40959.801025,
+        42458.992983
+      ],
+      "weewxdb_samples_ms": [
+        3008.133064,
+        2987.329078,
+        3077.063941
+      ]
+    },
+    {
+      "workload": "incremental",
+      "sqlite_median_ms": 51.168173,
+      "weewxdb_median_ms": 50.007727,
+      "speedup": 1.0232053338477072,
+      "sqlite_samples_ms": [
+        51.168173,
+        47.144177,
+        59.415789
+      ],
+      "weewxdb_samples_ms": [
+        50.007727,
+        48.428148,
+        50.553092
+      ]
+    },
+    {
+      "workload": "idle",
+      "sqlite_median_ms": 2.305213,
+      "weewxdb_median_ms": 2.124984,
+      "speedup": 1.0848142856605039,
+      "sqlite_samples_ms": [
+        2.305213,
+        1.318464,
+        2.576387
+      ],
+      "weewxdb_samples_ms": [
+        1.96413,
+        2.242037,
+        2.124984
+      ]
+    }
+  ],
+  "note": "Complete JSONGenerator.start timings include database access, unit conversion and file serialization. All parsed JSON outputs match after removing index.rebuilt. Computed mode uses 1e-10 relative / 1e-9 absolute float tolerance; stored mode requires exact equality. Three sensors, ten-year fixture, UTC, warm OS cache; not a Raspberry Pi measurement."
+}

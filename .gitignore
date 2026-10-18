@@ -1,0 +1,4 @@
+/target/
+/python/weewxdb/*.so
+/python/weewxdb/*.pyd
+/python/weewxdb/*.dylib

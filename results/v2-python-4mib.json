@@ -1,0 +1,90 @@
+{
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+  "python": "3.13.16",
+  "cache_mib": 4,
+  "workspace_mib": 16,
+  "rounds": 7,
+  "cases": [
+    {
+      "workload": "weewx_raw_month",
+      "sqlite_median_ms": 2.955739,
+      "weewxdb_median_ms": 1.139076,
+      "speedup": 2.594856708419807,
+      "first_sqlite_ms": 4.407495,
+      "first_weewxdb_ms": 1.754659,
+      "verified_answers": 8
+    },
+    {
+      "workload": "weewx_hourly_year",
+      "sqlite_median_ms": 28.505075,
+      "weewxdb_median_ms": 13.782977,
+      "speedup": 2.06813629595406,
+      "first_sqlite_ms": 40.889031,
+      "first_weewxdb_ms": 20.70715,
+      "verified_answers": 8
+    },
+    {
+      "workload": "weewx_daily_year_mean",
+      "sqlite_median_ms": 0.019265,
+      "weewxdb_median_ms": 0.021269,
+      "speedup": 0.9057783628755466,
+      "first_sqlite_ms": 0.107556,
+      "first_weewxdb_ms": 0.256237,
+      "verified_answers": 8
+    },
+    {
+      "workload": "sql_group_hourly_year",
+      "sqlite_median_ms": 13.496003,
+      "weewxdb_median_ms": 9.609438,
+      "speedup": 1.404452893082821,
+      "first_sqlite_ms": 15.20016,
+      "first_weewxdb_ms": 9.81897,
+      "verified_answers": 8
+    }
+  ],
+  "writes": [
+    {
+      "engine": "sqlite_delete_full",
+      "commits": 200,
+      "median_ms": 3.5938665,
+      "p95_ms": 4.245379,
+      "total_ms": 709.072409,
+      "checkpoint_ms": null,
+      "bytes_before_checkpoint": 122880,
+      "bytes_after_checkpoint": 122880
+    },
+    {
+      "engine": "sqlite_wal_full",
+      "commits": 200,
+      "median_ms": 1.3013020000000002,
+      "p95_ms": 1.496318,
+      "total_ms": 272.183599,
+      "checkpoint_ms": null,
+      "bytes_before_checkpoint": 4321024,
+      "bytes_after_checkpoint": 155648
+    },
+    {
+      "engine": "weewxdb_always",
+      "commits": 200,
+      "median_ms": 1.6992025,
+      "p95_ms": 1.911866,
+      "total_ms": 346.097093,
+      "checkpoint_ms": 10.103639,
+      "bytes_before_checkpoint": 1321012,
+      "bytes_after_checkpoint": 51329
+    },
+    {
+      "engine": "weewxdb_background",
+      "commits": 200,
+      "median_ms": 1.737042,
+      "p95_ms": 2.54538,
+      "total_ms": 370.525884,
+      "checkpoint_ms": 10.742293,
+      "bytes_before_checkpoint": 1321012,
+      "bytes_after_checkpoint": 51328
+    }
+  ],
+  "weewx_source": "/home/hilman2/.t3/worktrees/weewx/t3-92c12c8d/build/weewx-db-trial/json-source/src/weewx/__init__.py",
+  "peak_rss_kib": 49124,
+  "note": "Warm OS cache, alternating driver order, comparisons outside timing. Writes use actual DaySummaryManager.addRecord, one transaction per record, including daily summaries. Always modes sync before acknowledgement; background allows loss of the newest transaction. Not full report rendering. RSS covers Python and both engines."
+}

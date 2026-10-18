@@ -1,0 +1,60 @@
+{
+  "platform": "linux-x86_64",
+  "sqlite_version": "3.53.2",
+  "source": "build/weewx-db-trial/ten-years.sdb",
+  "database": "build/weewx-db-trial/ten-years.wwdb",
+  "archive_rows": 1051200,
+  "source_bytes": 177381376,
+  "database_bytes": 163026223,
+  "cache_limit_bytes_per_engine": 33554432,
+  "custom_cache_resident_bytes": 17082000,
+  "rounds": 9,
+  "cache_note": "First queries use new connections and empty engine caches. OS caches are not cleared. Medians follow one warmup; engine order alternates. Cache budgets exclude indices, results, SQLite overhead and OS cache. SQLite statements are cached and mmap is disabled. Read-only microbenchmark, not report or durable write throughput.",
+  "cases": [
+    {
+      "workload": "raw_day",
+      "first_sqlite_ms": 0.068655,
+      "first_weewxdb_ms": 0.013294,
+      "sqlite_median_ms": 0.0168,
+      "weewxdb_median_ms": 0.0026850000000000003,
+      "speedup": 6.256983240223462,
+      "verified_answers": 11
+    },
+    {
+      "workload": "raw_month",
+      "first_sqlite_ms": 0.765266,
+      "first_weewxdb_ms": 0.067092,
+      "sqlite_median_ms": 0.442077,
+      "weewxdb_median_ms": 0.044251,
+      "speedup": 9.990214910397505,
+      "verified_answers": 11
+    },
+    {
+      "workload": "hourly_year",
+      "first_sqlite_ms": 19.664145,
+      "first_weewxdb_ms": 1.056647,
+      "sqlite_median_ms": 15.923011,
+      "weewxdb_median_ms": 0.625811,
+      "speedup": 25.443801722884388,
+      "verified_answers": 11
+    },
+    {
+      "workload": "raw_entire_archive",
+      "first_sqlite_ms": 85.464596,
+      "first_weewxdb_ms": 9.338331,
+      "sqlite_median_ms": 77.789418,
+      "weewxdb_median_ms": 5.426187,
+      "speedup": 14.335926498662873,
+      "verified_answers": 11
+    },
+    {
+      "workload": "stored_daily_year_mean",
+      "first_sqlite_ms": 0.048769,
+      "first_weewxdb_ms": 0.025477,
+      "sqlite_median_ms": 0.013354,
+      "weewxdb_median_ms": 0.007063,
+      "speedup": 1.8906980036811554,
+      "verified_answers": 11
+    }
+  ]
+}

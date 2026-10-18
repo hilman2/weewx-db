@@ -1,0 +1,73 @@
+{
+  "generator_ref": "28ac6ab8",
+  "generator_source": "/home/hilman2/.t3/worktrees/weewx/t3-92c12c8d/build/weewx-db-trial/json-source/src/weewx/jsongenerator.py",
+  "execution": {
+    "cpu_affinity": [
+      6
+    ],
+    "cpu_max_frequency_khz": "3351352",
+    "smt_siblings": "6,18",
+    "thread_affinities": {
+      "1331165": [
+        6
+      ]
+    }
+  },
+  "cache_mib": 128,
+  "workspace_mib": 256,
+  "rounds": 3,
+  "json_files": 56,
+  "json_bytes": 766530,
+  "computed_observations": true,
+  "cases": [
+    {
+      "workload": "rebuild",
+      "sqlite_median_ms": 24163.394815,
+      "weewxdb_median_ms": 539.139927,
+      "speedup": 44.81841096328227,
+      "sqlite_samples_ms": [
+        23328.265665,
+        24163.394815,
+        24212.322556
+      ],
+      "weewxdb_samples_ms": [
+        529.451403,
+        539.139927,
+        543.36521
+      ]
+    },
+    {
+      "workload": "incremental",
+      "sqlite_median_ms": 48.559219,
+      "weewxdb_median_ms": 48.076079,
+      "speedup": 1.0100494884368585,
+      "sqlite_samples_ms": [
+        49.290092,
+        46.773864,
+        48.559219
+      ],
+      "weewxdb_samples_ms": [
+        49.842248,
+        48.076079,
+        46.284893
+      ]
+    },
+    {
+      "workload": "idle",
+      "sqlite_median_ms": 32.462112,
+      "weewxdb_median_ms": 2.341248,
+      "speedup": 13.865302607839919,
+      "sqlite_samples_ms": [
+        32.462112,
+        1.344832,
+        70.052284
+      ],
+      "weewxdb_samples_ms": [
+        2.190494,
+        3.384391,
+        2.341248
+      ]
+    }
+  ],
+  "note": "Complete JSONGenerator.start timings include database access, unit conversion and file serialization. All parsed JSON outputs match after removing index.rebuilt. Computed mode uses 1e-10 relative / 1e-9 absolute float tolerance; stored mode requires exact equality. Three sensors, ten-year fixture, UTC, warm OS cache; not a Raspberry Pi measurement."
+}

@@ -1,0 +1,158 @@
+{
+  "execution": {
+    "cpu_affinity": [
+      6
+    ],
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+    "python": "3.13.16",
+    "weewx_source": "/home/hilman2/.t3/worktrees/weewx/t3-92c12c8d/src/weewx/xtypes.py"
+  },
+  "rounds": 3,
+  "cache_mib": 128,
+  "workspace_mib": 256,
+  "scalar_rows": 1051200,
+  "scalar_span": [
+    1704067200,
+    2019427200
+  ],
+  "hourly_span": [
+    1987891200,
+    2019427200
+  ],
+  "cases": [
+    {
+      "workload": "dewpoint_mean",
+      "baseline_median_ms": 6708.8415,
+      "native_median_ms": 15.202506,
+      "speedup": 441.29839514616873,
+      "baseline_samples_ms": [
+        6720.333731,
+        6685.902449,
+        6708.8415
+      ],
+      "native_samples_ms": [
+        15.582389,
+        15.189342,
+        15.202506
+      ],
+      "first_baseline_ms": 6827.73133,
+      "first_native_ms": 36.54117,
+      "verified_answers": 4
+    },
+    {
+      "workload": "dewpoint_hourly_year",
+      "baseline_median_ms": 852.506731,
+      "native_median_ms": 23.688628,
+      "speedup": 35.98801631736544,
+      "baseline_samples_ms": [
+        851.438174,
+        852.506731,
+        858.077167
+      ],
+      "native_samples_ms": [
+        23.688628,
+        24.434557,
+        22.62061
+      ],
+      "first_baseline_ms": 848.856527,
+      "first_native_ms": 24.209026,
+      "verified_answers": 4
+    },
+    {
+      "workload": "humidex_mean",
+      "baseline_median_ms": 6860.915048,
+      "native_median_ms": 27.547082,
+      "speedup": 249.06140868205205,
+      "baseline_samples_ms": [
+        6871.476272,
+        6860.915048,
+        6852.624464
+      ],
+      "native_samples_ms": [
+        27.547082,
+        27.472426,
+        28.013963
+      ],
+      "first_baseline_ms": 6890.374366,
+      "first_native_ms": 27.499826,
+      "verified_answers": 4
+    },
+    {
+      "workload": "humidex_hourly_year",
+      "baseline_median_ms": 875.926999,
+      "native_median_ms": 25.465807,
+      "speedup": 34.39620032461567,
+      "baseline_samples_ms": [
+        879.608812,
+        875.926999,
+        873.496799
+      ],
+      "native_samples_ms": [
+        24.132085,
+        25.465807,
+        26.748977
+      ],
+      "first_baseline_ms": 877.859552,
+      "first_native_ms": 24.77633,
+      "verified_answers": 4
+    },
+    {
+      "workload": "heatindex_mean",
+      "baseline_median_ms": 6814.401868,
+      "native_median_ms": 9.325101,
+      "speedup": 730.7590414302215,
+      "baseline_samples_ms": [
+        6803.297414,
+        6820.928357,
+        6814.401868
+      ],
+      "native_samples_ms": [
+        9.326413,
+        9.297831,
+        9.325101
+      ],
+      "first_baseline_ms": 6810.358927,
+      "first_native_ms": 9.380371,
+      "verified_answers": 4
+    },
+    {
+      "workload": "heatindex_hourly_year",
+      "baseline_median_ms": 862.808183,
+      "native_median_ms": 23.081861,
+      "speedup": 37.38035607267542,
+      "baseline_samples_ms": [
+        862.023392,
+        862.808183,
+        866.770517
+      ],
+      "native_samples_ms": [
+        22.145033,
+        23.081861,
+        24.586574
+      ],
+      "first_baseline_ms": 869.312251,
+      "first_native_ms": 23.14717,
+      "verified_answers": 4
+    },
+    {
+      "workload": "humidex_sql_fusion",
+      "baseline_median_ms": 328.637055,
+      "native_median_ms": 26.437619,
+      "speedup": 12.430660075705001,
+      "baseline_samples_ms": [
+        328.465612,
+        328.637055,
+        338.059242
+      ],
+      "native_samples_ms": [
+        26.437619,
+        26.348095,
+        26.439453
+      ],
+      "first_baseline_ms": 332.335537,
+      "first_native_ms": 26.489533,
+      "verified_answers": 4
+    }
+  ],
+  "note": "On-demand derived observations, with no stored derived values or derived summaries. XType baseline is WeeWX Python over SQLite; SQL fusion baseline uses the same Rust UDF through the SQL row loop. First run is excluded from warm medians. Engine order alternates. Answers, units, NULLs and timestamps are checked after every pair with 1e-10 relative / 1e-9 absolute float tolerance. Warm OS cache; not a Raspberry Pi measurement."
+}

@@ -1,0 +1,84 @@
+{
+  "generator_ref": "28ac6ab8",
+  "generator_source": "/home/hilman2/.t3/worktrees/weewx/t3-92c12c8d/build/weewx-db-trial/json-source/src/weewx/jsongenerator.py",
+  "cache_mib": 128,
+  "workspace_mib": 256,
+  "rounds": 7,
+  "json_files": 56,
+  "json_bytes": 664499,
+  "cases": [
+    {
+      "workload": "rebuild",
+      "sqlite_median_ms": 730.776883,
+      "weewxdb_median_ms": 296.701991,
+      "speedup": 2.4629995927462445,
+      "sqlite_samples_ms": [
+        846.582678,
+        721.080367,
+        723.004534,
+        724.715573,
+        736.446428,
+        747.260292,
+        730.776883
+      ],
+      "weewxdb_samples_ms": [
+        300.450494,
+        296.701991,
+        338.201525,
+        297.832161,
+        286.897217,
+        287.884045,
+        290.008137
+      ]
+    },
+    {
+      "workload": "incremental",
+      "sqlite_median_ms": 28.95756,
+      "weewxdb_median_ms": 29.604679,
+      "speedup": 0.9781413269165999,
+      "sqlite_samples_ms": [
+        30.39466,
+        28.872194,
+        29.34185,
+        28.895677,
+        29.235797,
+        28.795524,
+        28.95756
+      ],
+      "weewxdb_samples_ms": [
+        31.179862,
+        29.604679,
+        28.871282,
+        35.591243,
+        28.586364,
+        35.35333,
+        29.013802
+      ]
+    },
+    {
+      "workload": "idle",
+      "sqlite_median_ms": 1.088514,
+      "weewxdb_median_ms": 1.293388,
+      "speedup": 0.8415989633427865,
+      "sqlite_samples_ms": [
+        1.144386,
+        0.881226,
+        1.088514,
+        0.941186,
+        1.106767,
+        0.867481,
+        1.17945
+      ],
+      "weewxdb_samples_ms": [
+        1.25057,
+        1.607711,
+        1.131463,
+        1.764878,
+        1.293388,
+        1.557319,
+        1.202863
+      ]
+    }
+  ],
+  "note": "Complete JSONGenerator.start timings include database access, unit conversion and file serialization. All parsed JSON outputs match exactly after removing index.rebuilt. Three sensors, ten-year fixture, UTC, warm OS cache; not a Raspberry Pi measurement."
+}

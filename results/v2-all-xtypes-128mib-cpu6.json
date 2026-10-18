@@ -1,0 +1,112 @@
+{
+  "execution": {
+    "cpu_affinity": [
+      6
+    ],
+    "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+    "python": "3.13.16",
+    "weewx_source": "/home/hilman2/.t3/worktrees/weewx/t3-92c12c8d/src/weewx/xtypes.py"
+  },
+  "rounds": 3,
+  "cache_mib": 128,
+  "workspace_mib": 256,
+  "archive_rows": 1051200,
+  "cases": [
+    {
+      "workload": "ET_hourly",
+      "baseline_median_ms": 2238.569322,
+      "native_median_ms": 108.396776,
+      "speedup": 20.651622719849158,
+      "baseline_samples_ms": [
+        2238.569322,
+        2254.308375,
+        2235.037352
+      ],
+      "native_samples_ms": [
+        109.635033,
+        108.396776,
+        107.733427
+      ],
+      "first_baseline_ms": 2371.236524,
+      "first_native_ms": 113.166632,
+      "verified_answers": 4
+    },
+    {
+      "workload": "appTemp_hourly",
+      "baseline_median_ms": 1151.58694,
+      "native_median_ms": 50.896798,
+      "speedup": 22.62592118270387,
+      "baseline_samples_ms": [
+        1155.419368,
+        1150.563624,
+        1151.58694
+      ],
+      "native_samples_ms": [
+        50.709367,
+        50.896798,
+        53.686875
+      ],
+      "first_baseline_ms": 1162.283411,
+      "first_native_ms": 50.349912,
+      "verified_answers": 4
+    },
+    {
+      "workload": "maxSolarRad_hourly",
+      "baseline_median_ms": 60.388022,
+      "native_median_ms": 17.261318,
+      "speedup": 3.498459503497937,
+      "baseline_samples_ms": [
+        60.388022,
+        60.527947,
+        60.08516
+      ],
+      "native_samples_ms": [
+        17.257973,
+        17.414928,
+        17.261318
+      ],
+      "first_baseline_ms": 60.720338,
+      "first_native_ms": 17.414278,
+      "verified_answers": 4
+    },
+    {
+      "workload": "historical_avg_daily_year",
+      "baseline_median_ms": 322.900011,
+      "native_median_ms": 5.066096,
+      "speedup": 63.7374441779232,
+      "baseline_samples_ms": [
+        322.900011,
+        332.412172,
+        322.884133
+      ],
+      "native_samples_ms": [
+        5.038786,
+        5.229183,
+        5.066096
+      ],
+      "first_baseline_ms": 320.637096,
+      "first_native_ms": 5.33172,
+      "verified_answers": 4
+    },
+    {
+      "workload": "sun_moon_positions_366_days",
+      "baseline_median_ms": 15.015024,
+      "native_median_ms": 19.414504,
+      "speedup": 0.7733920990204025,
+      "baseline_samples_ms": [
+        15.015024,
+        14.898411,
+        15.175666
+      ],
+      "native_samples_ms": [
+        19.357169,
+        19.414504,
+        19.477018
+      ],
+      "first_baseline_ms": 15.011698,
+      "first_native_ms": 19.479343,
+      "verified_answers": 4
+    }
+  ],
+  "note": "Warm OS cache, one excluded warmup, alternating engine order. All paired answers checked after timing with 1e-10 relative / 1e-9 absolute tolerance. ET has a one-hour sliding window. Solar XType covers seven days; other weather series cover 365 days. Historical xaggs uses 365 daily queries over all years. Astronomy baseline is PyEphem, whose core is already C. Not a Raspberry Pi measurement."
+}
