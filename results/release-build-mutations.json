@@ -13,5 +13,12 @@
     "mutation": "host metadata on cross build",
     "test": "tests/test_release_build.py::test_foreign_archive_uses_target_paths_and_metadata",
     "failure": "E           AssertionError: assert 'x86_64' == 'armv7l'\nE             \nE             - armv7l\nE             + x86_64\n\ntests/test_release_build.py:48: AssertionError"
+  },
+  {
+    "mutation": "Remove macOS extension link arguments",
+    "initial_ci_failure": "https://github.com/hilman2/weewx-db/actions/runs/39173047249/job/117809937516",
+    "original_output": "cargo:rustc-cdylib-link-arg=-undefined\ncargo:rustc-cdylib-link-arg=dynamic_lookup\n",
+    "mutated_output": "",
+    "restored_output": "cargo:rustc-cdylib-link-arg=-undefined\ncargo:rustc-cdylib-link-arg=dynamic_lookup\n"
   }
 ]

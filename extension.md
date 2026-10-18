@@ -32,6 +32,9 @@ sha256sum --ignore-missing --check SHA256SUMS
 weectl extension install weewx-db-0.2.0-aarch64-unknown-linux-gnu.zip
 ```
 
+On macOS, run `shasum -a 256 ARCHIVE.zip` and compare the printed hash with
+`SHA256SUMS`.
+
 Installation needs neither a Rust compiler nor pip.
 
 ## Build from source

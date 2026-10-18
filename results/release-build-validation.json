@@ -1,0 +1,73 @@
+{
+  "run_url": "https://github.com/hilman2/weewx-db/actions/runs/39173347421",
+  "source_commit": "1d571c81f66dd9b32995f0eff0f71e2178c7c356",
+  "conclusion": "success",
+  "python_tests": 474,
+  "rust_tests": 22,
+  "workflow_lint": "passed",
+  "runtime_checks": [
+    "module import",
+    "database create/write/read",
+    "solar position",
+    "CLI info"
+  ],
+  "armv7_runtime": "QEMU",
+  "draft_release": "skipped on manual runs",
+  "packages": [
+    {
+      "target": "aarch64-apple-darwin",
+      "archive": "weewx-db-0.2.0-aarch64-apple-darwin.zip",
+      "bytes": 8587988,
+      "sha256": "3b4d32abb3592c6ce7f23b295d559ad09055a29e32833a2ea58606bc825dcb38",
+      "python_runtime_versions": [
+        "3.9.13",
+        "3.13.15"
+      ],
+      "minimum_glibc": null
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "archive": "weewx-db-0.2.0-aarch64-unknown-linux-gnu.zip",
+      "bytes": 8078403,
+      "sha256": "9a428c137d9d914c21dc3929db7d6757d1aa446bc47624b49197ef21f944cc06",
+      "python_runtime_versions": [
+        "3.9.23",
+        "3.13.6"
+      ],
+      "minimum_glibc": "2.17"
+    },
+    {
+      "target": "armv7-unknown-linux-gnueabihf",
+      "archive": "weewx-db-0.2.0-armv7-unknown-linux-gnueabihf.zip",
+      "bytes": 8322015,
+      "sha256": "cfb8eebb693942e9dce09cb52672d7b93e44c302ef9e213dc5715f58d767a263",
+      "python_runtime_versions": [
+        "3.9.23",
+        "3.13.6"
+      ],
+      "minimum_glibc": "2.17"
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "archive": "weewx-db-0.2.0-x86_64-apple-darwin.zip",
+      "bytes": 9121277,
+      "sha256": "79e1477b62a0734b46daa47ebee26cfa4fa92d96586e45a93a5551b2a2ca3c93",
+      "python_runtime_versions": [
+        "3.9.25",
+        "3.13.15"
+      ],
+      "minimum_glibc": null
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "archive": "weewx-db-0.2.0-x86_64-unknown-linux-gnu.zip",
+      "bytes": 8718721,
+      "sha256": "4c7691c5f5010e9585ec77fa35cf575de293dd608a866feffb74fb94fd399e28",
+      "python_runtime_versions": [
+        "3.9.23",
+        "3.13.6"
+      ],
+      "minimum_glibc": "2.17"
+    }
+  ]
+}
