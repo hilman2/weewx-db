@@ -26,6 +26,7 @@ def build_archive(output):
 def test_real_extension_install_offline_import_cli_and_uninstall(tmp_path):
     archive = build_archive(tmp_path / 'dist')
     with zipfile.ZipFile(archive) as bundle:
+        assert any(name.endswith('/source/build.rs') for name in bundle.namelist())
         assert any(name.endswith('/source/src/analytics.rs') for name in bundle.namelist())
         assert any(name.endswith('/source/tools/build_extension.py') for name in bundle.namelist())
         assert not any(name.endswith('/weewx/jsongenerator.py') for name in bundle.namelist())

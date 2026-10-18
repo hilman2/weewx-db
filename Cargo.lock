@@ -666,6 +666,7 @@ dependencies = [
  "libc",
  "lz4_flex",
  "pyo3",
+ "pyo3-build-config",
  "rusqlite",
  "serde",
  "serde_json",
