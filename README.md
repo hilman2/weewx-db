@@ -1,54 +1,212 @@
 # WeeWX database
 
-An optional Rust database for WeeWX 5. It stores archive records and daily
-summaries in its own format and ships as a complete WeeWX extension: weedb
-driver, SQL CLI, native XTypes and a solar/lunar almanac. Your WeeWX
-installation stays on SQLite until you select the new driver.
+An optional Rust database for WeeWX 5. It replaces the SQLite archive of a
+station with its own column store and runs the weather calculations, daily
+aggregates and the solar/lunar almanac in Rust. It installs as one WeeWX
+extension and needs no compiler, no pip and no PyEphem on the station. Your
+SQLite archive stays on disk, and you can switch back at any time.
 
-The backend is experimental. Read the [supported operations and limits](reference.md)
-before switching a station. [Recorded measurements](results/README.md) compare
-it with SQLite through the drivers and through the WeeWX 5.6 JSON generator.
+The backend is experimental and has been measured on Linux x86_64 only. Read
+the [supported operations and limits](reference.md) before switching a station
+you rely on.
 
-## Install the extension
+## What you gain
+
+**Reports with calculated observations finish in a fraction of the time.**
+Dewpoint, humidex, heat index, apparent temperature, wind chill and
+evapotranspiration are calculated in Rust from the stored columns instead of
+record by record in Python. On a ten-year archive with five-minute records, a
+yearly hourly series of such an observation took 20 to 40 times less time than
+WeeWX on SQLite, and a mean over the whole archive took 250 to 700 times less.
+A JSON report rebuild that plots three calculated observations dropped from 24
+seconds to half a second. Reports on stored observations rebuild about twice
+as fast. Incremental updates of an existing report are as fast as before.
+
+**Long-term statistics come from summaries, not scans.** Every stored block
+carries count, sum, minimum and maximum. Historical aggregates such as the mean
+of a calendar day across all years, the xaggs-style queries, ran 64 times
+faster in the same measurements.
+
+**Sun and Moon need no PyEphem.** Rise, set, transit, twilight, phase and
+positions come from the Rust almanac, so the Sun and Moon details in the
+Seasons almanac appear without installing PyEphem.
+
+**Sensors are added in one statement.** `ALTER TABLE archive ADD COLUMN`
+takes effect immediately. Old records read as NULL and nothing is rewritten.
+No indexes are created or maintained by hand.
+
+**You keep SQL.** The bundled CLI runs SQLite syntax with window functions,
+time buckets and weather functions directly on the archive, and exports the
+current data back to a SQLite file at any time.
+
+**Memory stays within a budget you set.** Cache and workspace sizes are
+options in `weewx.conf`. A Raspberry Pi trial can run with 4 and 16 MiB, a NUC
+with 128 and 256 MiB. The budgets cap decoded columns and query workspace, not
+the whole process.
+
+The measurements behind these numbers, with raw reports and reproduction
+commands, are in [results/README.md](results/README.md). Small queries that
+SQLite already answers from its daily summaries, such as finding the wettest
+day, remain faster on SQLite.
+
+## Put it into operation
+
+The walkthrough assumes a WeeWX 5 pip installation with its root in
+`~/weewx-data`. On a package installation, the root is `/etc/weewx` and the
+databases live in `/var/lib/weewx`; adjust the paths accordingly. Plan a few
+minutes of downtime for the import. No archive record is lost: WeeWX catches
+up from the station's logger after the restart if the driver supports it.
+
+### 1. Install the extension
 
 Download the ZIP for your machine from the
 [releases](https://github.com/hilman2/weewx-db/releases) and install it with
-`weectl`. Installation needs neither a Rust compiler nor pip:
+`weectl`:
 
 ```sh
 weectl extension install weewx-db-0.2.0-aarch64-unknown-linux-gnu.zip
 ```
 
-The [extension guide](extension.md) explains which ZIP to choose, how to verify
-it, how to import your SQLite archive and switch the binding, and how to enable
-the optional adapters.
+The [extension guide](extension.md) lists the ZIP for each system, shows how to
+verify the download and describes what the installer writes. In short, it
+places the files under `bin/user/weewxdb` and adds a `weewx_rust` database
+entry to `weewx.conf`. Nothing else changes yet; WeeWX keeps running on SQLite.
 
-The extension does not include a JSON generator. The bundled adapter extends the
-generator that ships with WeeWX 5.6 and only works there. The database, XTypes
-and almanac do not depend on it.
+The extension does not include a JSON generator. Its JSON adapter extends the
+generator that ships with WeeWX 5.6. Everything else works on any WeeWX 5.
 
-## What changes after the switch
+### 2. Stop WeeWX and import the archive
 
-The extension adds a `weewx_rust` database entry to `weewx.conf`. Once
-`wx_binding` points to it, WeeWX writes archive records to the new file and the
-reports read from it. The driver registers its XType provider and the
-[solar/lunar almanac](astronomy.md) when opened. Sun, Moon and twilight
-calculations work without PyEphem.
+Stop the daemon so the SQLite file does not change during the import:
 
-The database runs with different RAM budgets. A small-device trial can use
-`cache_mib = 4` and `workspace_mib = 16`. A NUC trial can use 128 and 256.
-Neither setting limits total process RSS. See the
-[memory options](reference.md#memory-and-synchronization).
+```sh
+sudo systemctl stop weewx
+```
+
+Import the archive into a new file next to it. The import reads a consistent
+SQLite transaction, including committed WAL data, and copies the daily
+summaries as they are, including LOOP extrema and time weights. The
+destination must not exist yet. A ten-year archive with a million
+five-minute records took about one second on a desktop; expect longer on a
+Raspberry Pi.
+
+```sh
+~/weewx-data/bin/user/weewxdb/weewx-db import \
+    ~/weewx-data/archive/weewx.sdb ~/weewx-data/archive/weewx.wwdb
+~/weewx-data/bin/user/weewxdb/weewx-db info ~/weewx-data/archive/weewx.wwdb
+```
+
+`info` prints the schema, row count and timestamp bounds. Compare the row
+count and the last timestamp with your SQLite archive, for example with
+`sqlite3 weewx.sdb 'SELECT COUNT(*), MAX(dateTime) FROM archive'`. Use
+`import --table NAME` if your archive table has another name.
+
+### 3. Point the binding to the new database
+
+Edit `weewx.conf`. The installer already added the database entry; you only
+change the binding. Keep the manager, schema and `table_name` settings in the
+binding as they are.
+
+```ini
+[Databases]
+    [[weewx_rust]]
+        driver = user.weewxdb.driver
+        database_name = weewx.wwdb
+        SQLITE_ROOT = archive
+        cache_mib = 32
+        workspace_mib = 32
+        sync_mode = background
+
+[DataBindings]
+    [[wx_binding]]
+        database = weewx_rust
+```
+
+`SQLITE_ROOT` is relative to the WeeWX root. On a package installation set it
+to `/var/lib/weewx`. Leave the memory budgets at their defaults for the first
+run; the [memory options](reference.md#memory-and-synchronization) describe
+what each one covers.
+
+With `sync_mode = background`, a commit is acknowledged after its journal
+entry is written and synchronized by a worker. After a power failure at most
+the newest archive record can be lost. Set `always` if you prefer each record
+to be synchronized before WeeWX continues.
+
+### 4. Start WeeWX and check the reports
+
+```sh
+sudo systemctl start weewx
+```
+
+Watch the log until the first archive interval has passed. The driver opens
+the new file, registers its XTypes and almanac, and WeeWX writes the next
+record into it. Then open the reports: the current conditions, the daily
+plots and the almanac section should look as before. Yearly plots of
+calculated observations are the ones that got faster.
+
+To confirm that records arrive, query the newest one:
+
+```sh
+~/weewx-data/bin/user/weewxdb/weewx-db sql ~/weewx-data/archive/weewx.wwdb \
+    "SELECT datetime(dateTime, 'unixepoch', 'localtime'), outTemp
+     FROM archive ORDER BY dateTime DESC LIMIT 3"
+```
+
+Other bindings, for example a forecast or an air-quality database, keep using
+SQLite. Only the bindings you point at `weewx_rust` move.
+
+### 5. Enable the optional adapters
+
+Two more pieces are off by default because they replace WeeWX classes:
+
+- **JSON reports on WeeWX 5.6.** Swap the generator class in the report's
+  `skin.conf` so the generator fetches all series of a plot in one batch
+  from Rust. The driver alone already gives the rebuild gains above; batching
+  removes up to another half of the remaining time.
+- **Packet calculations.** Swap `StdWXCalculate` in `weewx.conf` so the
+  values in LOOP packets are calculated by the same Rust formulas.
+
+The [extension guide](extension.md#enable-the-json-adapter) has the exact
+lines to change for both.
+
+### 6. If you want to go back
+
+Stop WeeWX, point `wx_binding` back to the SQLite entry and start it again.
+Your SQLite file is still there, but it lacks the records written since the
+switch. To carry them over, export the current data to a new SQLite file and
+use that one instead:
+
+```sh
+~/weewx-data/bin/user/weewxdb/weewx-db export \
+    ~/weewx-data/archive/weewx.wwdb ~/weewx-data/archive/weewx-restored.sdb
+```
+
+`weectl extension uninstall weewx-db` removes the files; see
+[removing the extension](extension.md#remove-the-extension).
+
+## Keep it running
+
+The database writes changes to a journal and folds them into the main file
+when the journal reaches 8 MiB, so no scheduled maintenance is needed. These
+commands help when you want to look:
+
+```sh
+weewx-db check weewx.wwdb              # verify checksums and structure
+weewx-db info weewx.wwdb               # schema, row count, bounds, cache use
+weewx-db checkpoint weewx.wwdb --optimize   # fold the journal now
+weewx-db vacuum weewx.wwdb             # reclaim space after deletes
+```
+
+`weewx-db` stands for `bin/user/weewxdb/weewx-db` under your WeeWX root. For
+backups, either export to SQLite as above or stop WeeWX and copy the `.wwdb`
+file together with its `.wal`, `.head` and `.lock` sidecars. The
+[storage explanation](architecture.md) describes the journal, checkpoints and
+backup rules in detail.
 
 ## Query the database
 
-The extension installs the CLI as `bin/user/weewxdb/weewx-db` under your WeeWX
-root, for example `~/weewx-data/bin/user/weewxdb/weewx-db` for a pip
-installation or `/etc/weewx/bin/user/weewxdb/weewx-db` for a package
-installation. The examples below call it `weewx-db`.
-
-A nullable sensor needs one schema operation. Historical records receive NULL
-without rewriting the old payloads.
+A new sensor needs one schema operation. Historical records read as NULL
+without rewriting the old blocks.
 
 ```sh
 weewx-db sql weewx.wwdb 'ALTER TABLE archive ADD COLUMN pm25 REAL'
@@ -65,7 +223,7 @@ weewx-db sql weewx.wwdb \
 
 Use `--file query.sql` or stdin for longer SQL. Multiple statements execute in
 order; use an explicit BEGIN and COMMIT when they must be atomic. Weather
-calculations are available as SQL functions:
+calculations are available as SQL functions, here on Celsius archive values:
 
 ```sh
 weewx-db sql weewx.wwdb \
@@ -76,10 +234,9 @@ weewx-db sql weewx.wwdb \
     --param 1704067200 --param 1735689600 --format csv
 ```
 
-This example uses Celsius archive temperatures. The
-[SQL reference](reference.md#sql-and-calculations) lists native statistics,
+The [SQL reference](reference.md#sql-and-calculations) lists native statistics,
 window functions, the supported observations, Fahrenheit functions and XType
-dispatch rules. No manual CREATE INDEX is needed.
+dispatch rules.
 
 From Python, the extension package offers a DB-API connection. Each
 `execute()` call accepts one statement and positional parameters:
@@ -96,16 +253,15 @@ db.close()
 The [batch API reference](batch.md) documents joint series and aggregate
 queries, source policies and the bounded report cache.
 
-## Feed and export data
+## Feed data without WeeWX
 
-`init` creates a small default archive. JSONL append can add numeric sensors
-on request. A batch commits atomically; earlier completed batches survive an
-input error.
+`init` creates a small default archive, and `append` adds JSONL records,
+creating numeric sensors on request. A batch commits atomically; earlier
+completed batches survive an input error.
 
 ```sh
 weewx-db init readings.wwdb
 weewx-db append readings.wwdb readings.jsonl --auto-add
-cat readings.jsonl | xargs -d '\n' -I '{}' weewx-db append readings.wwdb --row '{}'
 weewx-db sql readings.wwdb \
     'SELECT dateTime,outTemp FROM archive ORDER BY dateTime' --format jsonl |
     jq -c 'select(.outTemp != null)'
@@ -115,25 +271,6 @@ For bulk input, one `append` process avoids opening a connection for each
 record. For many queries, `batch` reads JSONL requests such as
 `{"sql":"SELECT COUNT(*) FROM archive","params":[]}` in one session.
 CSV, TSV and JSONL exports stream rows.
-
-To return the current data, including journaled changes, to SQLite:
-
-```sh
-weewx-db export weewx.wwdb restored.sdb
-```
-
-## Check and maintain the database
-
-```sh
-weewx-db check weewx.wwdb
-weewx-db info weewx.wwdb
-weewx-db checkpoint weewx.wwdb --optimize
-weewx-db vacuum weewx.wwdb
-```
-
-Checkpoint updates affected blocks and their summaries. Vacuum reclaims
-obsolete blocks. The [storage explanation](architecture.md) describes the
-journal, automatic indices, synchronization and backup files.
 
 ## Develop and test
 
