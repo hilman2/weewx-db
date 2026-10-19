@@ -6,10 +6,6 @@ SQL queries and a pipeline CLI. Time-series calculations run in Rust through
 an XType provider. The existing WeeWX installation stays on SQLite until you
 select the new driver.
 
-This repository preserves the database experiment originally developed inside
-the WeeWX checkout. [Source provenance and licenses](NOTICE.md) identify the
-upstream references and the original snapshot.
-
 The backend is experimental. Read the [supported operations and limits](reference.md)
 before switching an installation. [Recorded measurements](results/README.md)
 include SQLite comparisons through the drivers and the JSON generator.
