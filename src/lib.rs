@@ -12,6 +12,7 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 pub mod store;
+mod changes;
 pub mod computed;
 pub mod weather;
 pub mod solar;
@@ -275,13 +276,29 @@ pub struct ReadMetrics {
 /// The cache limit covers column payloads, not the index, results or OS cache.
 pub struct Database {
     file: File,
-    manifest: Manifest,
-    cache: HashMap<u64, Arc<[u8]>>,
-    order: VecDeque<u64>,
-    cache_bytes: usize,
+    manifest: Arc<Manifest>,
+    cache: Arc<std::sync::Mutex<BlockCache>>,
     cache_limit: usize,
     metrics: ReadMetrics,
 }
+
+/// Decoded column blocks by file offset, oldest first out.
+struct BlockCache { blocks: HashMap<u64, Arc<[u8]>>, order: VecDeque<u64>, bytes: usize, limit: usize }
+
+/// Parsed manifests and decoded blocks of one database file, shared by every
+/// connection of this process. WeeWX opens new connections for each report,
+/// which then start with a parsed index and warm blocks. A block never
+/// changes at its offset: the file only grows, and vacuum writes a new file
+/// with a new inode, which gets its own entry.
+struct SharedFile { manifests: Vec<((u64, u64, u32), Arc<Manifest>)>, cache: Arc<std::sync::Mutex<BlockCache>> }
+
+fn shared_files() -> &'static std::sync::Mutex<HashMap<(std::path::PathBuf, u64), SharedFile>> {
+    static FILES: std::sync::OnceLock<std::sync::Mutex<HashMap<(std::path::PathBuf, u64), SharedFile>>> = std::sync::OnceLock::new();
+    FILES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Manifests kept per file: the base index and recent checkpoints.
+const SHARED_MANIFESTS: usize = 4;
 
 pub fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -366,6 +383,64 @@ fn timestamp(bytes: &[u8], rows: usize, i: usize) -> i64 {
 fn null_column() -> Arc<[u8]> {
     static EMPTY: std::sync::OnceLock<Arc<[u8]>> = std::sync::OnceLock::new();
     EMPTY.get_or_init(|| Arc::from(Vec::new())).clone()
+}
+
+/// The manifest stored at `offset`, parsed and validated once per process.
+/// `base` applies the identity of indices written before identities existed.
+fn manifest_at(file: &mut File, shared: &mut SharedFile, (offset, length, checksum): (u64, u64, u32), base: bool) -> Result<Arc<Manifest>> {
+    if let Some((_, manifest)) = shared.manifests.iter().find(|(key, _)| *key == (offset, length, checksum)) {
+        return Ok(manifest.clone());
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut metadata = vec![0; length as usize];
+    file.read_exact(&mut metadata)?;
+    ensure!(crc32fast::hash(&metadata) == checksum, "index checksum mismatch");
+    let mut manifest: Manifest = serde_json::from_slice(&metadata)?;
+    if base && manifest.id.is_empty() { manifest.id = format!("legacy-{offset}-{checksum}"); }
+    for table in &manifest.tables {
+        ensure!(
+            table
+                .columns
+                .iter()
+                .any(|c| c.name == "dateTime" && matches!(c.kind, Kind::Integer)),
+            "invalid timestamp column"
+        );
+        let mut previous = None;
+        let mut row_count = 0;
+        for block in &table.blocks {
+            ensure!(
+                block.rows > 0
+                    && block.rows <= BLOCK_ROWS
+                    && block.first <= block.last
+                    && previous.is_none_or(|p| block.first > p)
+                && block.columns.len() <= table.columns.len(),
+                "invalid block index"
+            );
+            for column in &block.columns {
+                ensure!(
+                    (column.length == 0 || (!column.compressed && column.length == block_bytes(block.rows))
+                        || (column.compressed && column.length < block_bytes(block.rows)))
+                        && column.offset >= HEADER_BYTES
+                        && column
+                            .offset
+                            .checked_add(column.length as u64)
+                            .is_some_and(|end| end <= offset),
+                    "invalid column bounds"
+                );
+                ensure!(
+                    column.length != 0 || column.checksum == crc32fast::hash(&[]),
+                    "invalid NULL column"
+                );
+            }
+            previous = Some(block.last);
+            row_count += block.rows as u64;
+        }
+        ensure!(row_count == table.rows, "row count mismatch");
+    }
+    let manifest = Arc::new(manifest);
+    if shared.manifests.len() >= SHARED_MANIFESTS { shared.manifests.remove(0); }
+    shared.manifests.push(((offset, length, checksum), manifest.clone()));
+    Ok(manifest)
 }
 
 fn new_id() -> Result<String> {
@@ -548,94 +623,49 @@ pub fn import_sqlite(source: &Path, destination: &Path, archive: &str) -> Result
 impl Database {
     pub fn open(path: &Path, cache_limit: usize) -> Result<Self> {
         let mut file = File::open(path)?;
+        let metadata = file.metadata()?;
+        let size = metadata.len();
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+        #[cfg(not(unix))]
+        let inode = 0;
         let mut header = [0; HEADER_BYTES as usize];
         file.read_exact(&mut header)
             .context("truncated database header")?;
         ensure!(&header[..8] == MAGIC || &header[..8] == b"WWXDB001", "unsupported database format");
-        let mut offset = u64::from_le_bytes(header[8..16].try_into()?);
-        let mut length = u64::from_le_bytes(header[16..24].try_into()?);
-        let mut checksum = u32::from_le_bytes(header[24..28].try_into()?);
+        let offset = u64::from_le_bytes(header[8..16].try_into()?);
+        let length = u64::from_le_bytes(header[16..24].try_into()?);
+        let checksum = u32::from_le_bytes(header[24..28].try_into()?);
         ensure!(
             length <= MAX_MANIFEST_BYTES
                 && offset >= HEADER_BYTES
-                && offset.checked_add(length).is_some_and(|end| end <= file.metadata().map_or(0, |m| m.len())),
+                && offset.checked_add(length).is_some_and(|end| end <= size),
             "invalid index bounds"
         );
-        file.seek(SeekFrom::Start(offset))?;
-        let mut metadata = vec![0; length as usize];
-        file.read_exact(&mut metadata)?;
-        ensure!(
-            crc32fast::hash(&metadata) == checksum,
-            "index checksum mismatch"
-        );
-        let mut manifest: Manifest = serde_json::from_slice(&metadata)?;
-        if manifest.id.is_empty() { manifest.id = format!("legacy-{offset}-{checksum}"); }
+        let mut files = shared_files().lock().map_err(|_| anyhow::anyhow!("database registry poisoned"))?;
+        let shared = files.entry((std::fs::canonicalize(path)?, inode)).or_insert_with(|| SharedFile {
+            manifests: Vec::new(),
+            cache: Arc::new(std::sync::Mutex::new(BlockCache { blocks: HashMap::new(), order: VecDeque::new(), bytes: 0, limit: 0 })),
+        });
+        let mut manifest = manifest_at(&mut file, shared, (offset, length, checksum), true)?;
         if let Some(head) = store::read_head(path)? {
             ensure!(head.id == manifest.id, "checkpoint belongs to another database");
             if head.lsn > manifest.lsn {
-                offset = head.offset;
-                length = head.length;
-                checksum = head.checksum;
-                ensure!(length <= MAX_MANIFEST_BYTES && offset >= HEADER_BYTES
-                    && offset.checked_add(length).is_some_and(|end| end <= file.metadata().map_or(0, |m| m.len())), "invalid checkpoint bounds");
-                file.seek(SeekFrom::Start(offset))?;
-                metadata.resize(length as usize, 0);
-                file.read_exact(&mut metadata)?;
-                ensure!(crc32fast::hash(&metadata) == checksum, "checkpoint index checksum mismatch");
-                let latest: Manifest = serde_json::from_slice(&metadata)?;
+                ensure!(head.length <= MAX_MANIFEST_BYTES && head.offset >= HEADER_BYTES
+                    && head.offset.checked_add(head.length).is_some_and(|end| end <= size), "invalid checkpoint bounds");
+                let latest = manifest_at(&mut file, shared, (head.offset, head.length, head.checksum), false)
+                    .context("checkpoint index")?;
                 ensure!(latest.id == manifest.id && latest.lsn == head.lsn, "invalid checkpoint identity");
                 manifest = latest;
             }
         }
-        for table in &manifest.tables {
-            ensure!(
-                table
-                    .columns
-                    .iter()
-                    .any(|c| c.name == "dateTime" && matches!(c.kind, Kind::Integer)),
-                "invalid timestamp column"
-            );
-            let mut previous = None;
-            let mut row_count = 0;
-            for block in &table.blocks {
-                ensure!(
-                    block.rows > 0
-                        && block.rows <= BLOCK_ROWS
-                        && block.first <= block.last
-                        && previous.is_none_or(|p| block.first > p)
-                    && block.columns.len() <= table.columns.len(),
-                    "invalid block index"
-                );
-                for column in &block.columns {
-                    ensure!(
-                        (column.length == 0 || (!column.compressed && column.length == block_bytes(block.rows))
-                            || (column.compressed && column.length < block_bytes(block.rows)))
-                            && column.offset >= HEADER_BYTES
-                            && column
-                                .offset
-                                .checked_add(column.length as u64)
-                                .is_some_and(|end| end <= offset),
-                        "invalid column bounds"
-                    );
-                    ensure!(
-                        column.length != 0 || column.checksum == crc32fast::hash(&[]),
-                        "invalid NULL column"
-                    );
-                }
-                previous = Some(block.last);
-                row_count += block.rows as u64;
-            }
-            ensure!(row_count == table.rows, "row count mismatch");
+        let cache = shared.cache.clone();
+        drop(files);
+        {
+            let mut cache = cache.lock().map_err(|_| anyhow::anyhow!("block cache poisoned"))?;
+            cache.limit = cache.limit.max(cache_limit);
         }
-        Ok(Self {
-            file,
-            manifest,
-            cache: HashMap::new(),
-            order: VecDeque::new(),
-            cache_bytes: 0,
-            cache_limit,
-            metrics: ReadMetrics::default(),
-        })
+        Ok(Self { file, manifest, cache, cache_limit, metrics: ReadMetrics::default() })
     }
 
     pub fn info(&self) -> Info {
@@ -658,8 +688,8 @@ impl Database {
                 .iter()
                 .map(|t| t.name.clone())
                 .collect(),
-            cache_bytes: self.cache_bytes,
-            cache_limit_bytes: self.cache_limit,
+            cache_bytes: self.cache.lock().map_or(0, |c| c.bytes),
+            cache_limit_bytes: self.cache.lock().map_or(self.cache_limit, |c| c.limit),
             reads: self.metrics.clone(),
         }
     }
@@ -693,7 +723,7 @@ impl Database {
         if column.length == 0 {
             return Ok(null_column());
         }
-        if let Some(bytes) = self.cache.get(&column.offset) {
+        if let Some(bytes) = self.cache.lock().map_err(|_| anyhow::anyhow!("block cache poisoned"))?.blocks.get(&column.offset) {
             return Ok(bytes.clone());
         }
         let expected = block_bytes(block.rows);
@@ -712,14 +742,17 @@ impl Database {
             ensure!(bytes.len() == expected,"invalid decompressed column length");
         }
         let bytes: Arc<[u8]> = bytes.into();
-        if bytes.len() <= self.cache_limit {
-            while self.cache_bytes + bytes.len() > self.cache_limit {
-                let oldest = self.order.pop_front().unwrap();
-                self.cache_bytes -= self.cache.remove(&oldest).unwrap().len();
+        let offset = column.offset;
+        let mut cache = self.cache.lock().map_err(|_| anyhow::anyhow!("block cache poisoned"))?;
+        if bytes.len() <= cache.limit && !cache.blocks.contains_key(&offset) {
+            while cache.bytes + bytes.len() > cache.limit {
+                let oldest = cache.order.pop_front().unwrap();
+                let removed = cache.blocks.remove(&oldest).unwrap().len();
+                cache.bytes -= removed;
             }
-            self.cache_bytes += bytes.len();
-            self.order.push_back(column.offset);
-            self.cache.insert(column.offset, bytes.clone());
+            cache.bytes += bytes.len();
+            cache.order.push_back(offset);
+            cache.blocks.insert(offset, bytes.clone());
         }
         Ok(bytes)
     }

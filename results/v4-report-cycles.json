@@ -1,0 +1,387 @@
+{
+  "date": "2026-10-19",
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+  "python": "3.14.4",
+  "archive": "tools/station_fixture.py, ten years, 1,051,200 five-minute records, wview_extended schema",
+  "skins": {
+    "weewx-source": {
+      "repository": "https://github.com/hilman2/weewx.git",
+      "revision": "def717274ef07da1910f9a0975f8d76ed287aa47"
+    },
+    "belchertown-source": {
+      "repository": "https://github.com/poblabs/weewx-belchertown.git",
+      "revision": "049f615952da8d9e0c779ccab9e6f64cf88fedf6"
+    },
+    "neowx-material-source": {
+      "repository": "https://github.com/neoground/neowx-material.git",
+      "revision": "1a09af0052b25a1d4a8a0877b02b89868cd8a307"
+    },
+    "wdc-source": {
+      "repository": "https://github.com/Daveiano/weewx-wdc.git",
+      "revision": "4634c248fefa6d68d90ccbb723a84a0ba24fa655"
+    }
+  },
+  "execution": "tools/bench_skins.py --advance --runs 7. One process per skin and variant, pinned to one of the equal 3.35 GHz cores 4-11, starts staggered by 10 s. A writer connection adds one archive record before every repeated run, as WeeWX does between report cycles. Peak RSS covers the whole process.",
+  "runs": [
+    {
+      "skin": "Seasons",
+      "engine": "sqlite",
+      "files": 193,
+      "peak_rss_mib": 61,
+      "complete_s": 4.672,
+      "repeated_s": [
+        0.728,
+        0.719,
+        0.718,
+        0.722,
+        0.726,
+        0.711,
+        0.716
+      ],
+      "variant": "SQLite",
+      "repeated_median_s": 0.719
+    },
+    {
+      "skin": "Belchertown",
+      "engine": "sqlite",
+      "files": 190,
+      "peak_rss_mib": 63,
+      "complete_s": 6.893,
+      "repeated_s": [
+        0.4,
+        0.406,
+        0.4,
+        0.418,
+        0.393,
+        0.449,
+        0.41
+      ],
+      "variant": "SQLite",
+      "repeated_median_s": 0.406
+    },
+    {
+      "skin": "neowx-material",
+      "engine": "sqlite",
+      "files": 594,
+      "peak_rss_mib": 50,
+      "complete_s": 10.146,
+      "repeated_s": [
+        1.549,
+        1.555,
+        1.54,
+        1.555,
+        1.536,
+        1.57,
+        1.571
+      ],
+      "variant": "SQLite",
+      "repeated_median_s": 1.555
+    },
+    {
+      "skin": "weewx-wdc",
+      "engine": "sqlite",
+      "files": 275,
+      "peak_rss_mib": 58,
+      "complete_s": 177.257,
+      "repeated_s": [
+        3.977,
+        3.964,
+        3.973,
+        4.065,
+        3.959,
+        3.965,
+        3.964
+      ],
+      "variant": "SQLite",
+      "repeated_median_s": 3.965
+    },
+    {
+      "skin": "Seasons",
+      "engine": "rust",
+      "files": 193,
+      "peak_rss_mib": 89,
+      "complete_s": 3.712,
+      "repeated_s": [
+        0.522,
+        0.529,
+        0.52,
+        0.52,
+        0.517,
+        0.529,
+        0.634
+      ],
+      "variant": "Rust before reuse across runs (commit 1590828)",
+      "repeated_median_s": 0.522
+    },
+    {
+      "skin": "Belchertown",
+      "engine": "rust",
+      "files": 190,
+      "peak_rss_mib": 94,
+      "complete_s": 5.602,
+      "repeated_s": [
+        0.372,
+        0.37,
+        0.373,
+        0.418,
+        0.373,
+        0.43,
+        0.44
+      ],
+      "variant": "Rust before reuse across runs (commit 1590828)",
+      "repeated_median_s": 0.373
+    },
+    {
+      "skin": "neowx-material",
+      "engine": "rust",
+      "files": 594,
+      "peak_rss_mib": 107,
+      "complete_s": 8.985,
+      "repeated_s": [
+        1.071,
+        1.055,
+        1.062,
+        1.067,
+        1.054,
+        1.064,
+        1.05
+      ],
+      "variant": "Rust before reuse across runs (commit 1590828)",
+      "repeated_median_s": 1.062
+    },
+    {
+      "skin": "weewx-wdc",
+      "engine": "rust",
+      "files": 275,
+      "peak_rss_mib": 130,
+      "complete_s": 156.753,
+      "repeated_s": [
+        3.392,
+        3.389,
+        3.39,
+        3.401,
+        3.382,
+        3.378,
+        3.383
+      ],
+      "variant": "Rust before reuse across runs (commit 1590828)",
+      "repeated_median_s": 3.389
+    },
+    {
+      "skin": "Seasons",
+      "engine": "rust",
+      "files": 193,
+      "peak_rss_mib": 88,
+      "complete_s": 4.24,
+      "repeated_s": [
+        0.482,
+        0.479,
+        0.488,
+        0.474,
+        0.481,
+        0.464,
+        0.485
+      ],
+      "variant": "Rust, shared snapshot, result_cache = 0",
+      "repeated_median_s": 0.481
+    },
+    {
+      "skin": "Belchertown",
+      "engine": "rust",
+      "files": 190,
+      "peak_rss_mib": 84,
+      "complete_s": 5.512,
+      "repeated_s": [
+        0.329,
+        0.324,
+        0.328,
+        0.352,
+        0.357,
+        0.348,
+        0.346
+      ],
+      "variant": "Rust, shared snapshot, result_cache = 0",
+      "repeated_median_s": 0.346
+    },
+    {
+      "skin": "neowx-material",
+      "engine": "rust",
+      "files": 594,
+      "peak_rss_mib": 108,
+      "complete_s": 8.744,
+      "repeated_s": [
+        0.997,
+        1.001,
+        1.041,
+        1.038,
+        1.038,
+        1.027,
+        1.036
+      ],
+      "variant": "Rust, shared snapshot, result_cache = 0",
+      "repeated_median_s": 1.036
+    },
+    {
+      "skin": "weewx-wdc",
+      "engine": "rust",
+      "files": 275,
+      "peak_rss_mib": 115,
+      "complete_s": 156.682,
+      "repeated_s": [
+        3.343,
+        3.331,
+        3.341,
+        3.351,
+        3.346,
+        3.359,
+        3.376
+      ],
+      "variant": "Rust, shared snapshot, result_cache = 0",
+      "repeated_median_s": 3.346
+    },
+    {
+      "skin": "Seasons",
+      "engine": "rust",
+      "files": 193,
+      "peak_rss_mib": 92,
+      "complete_s": 4.023,
+      "repeated_s": [
+        0.454,
+        0.492,
+        0.467,
+        0.464,
+        0.46,
+        0.475,
+        0.48
+      ],
+      "variant": "Rust, result_cache = 4096",
+      "repeated_median_s": 0.467
+    },
+    {
+      "skin": "Belchertown",
+      "engine": "rust",
+      "files": 190,
+      "peak_rss_mib": 89,
+      "complete_s": 5.814,
+      "repeated_s": [
+        0.309,
+        0.394,
+        0.354,
+        0.318,
+        0.319,
+        0.333,
+        0.312
+      ],
+      "variant": "Rust, result_cache = 4096",
+      "repeated_median_s": 0.319
+    },
+    {
+      "skin": "neowx-material",
+      "engine": "rust",
+      "files": 594,
+      "peak_rss_mib": 113,
+      "complete_s": 9.469,
+      "repeated_s": [
+        1.043,
+        1.053,
+        1.07,
+        1.067,
+        1.065,
+        1.058,
+        1.078
+      ],
+      "variant": "Rust, result_cache = 4096",
+      "repeated_median_s": 1.065
+    },
+    {
+      "skin": "weewx-wdc",
+      "engine": "rust",
+      "files": 275,
+      "peak_rss_mib": 122,
+      "complete_s": 161.989,
+      "repeated_s": [
+        3.363,
+        3.388,
+        3.394,
+        3.359,
+        3.41,
+        3.377,
+        3.528
+      ],
+      "variant": "Rust, result_cache = 4096",
+      "repeated_median_s": 3.388
+    },
+    {
+      "skin": "Seasons",
+      "engine": "rust",
+      "files": 193,
+      "peak_rss_mib": 106,
+      "complete_s": 4.012,
+      "repeated_s": [
+        0.491,
+        0.471,
+        0.466,
+        0.462,
+        0.473,
+        0.453,
+        0.462
+      ],
+      "variant": "Rust, result_cache = 16384",
+      "repeated_median_s": 0.466
+    },
+    {
+      "skin": "Belchertown",
+      "engine": "rust",
+      "files": 190,
+      "peak_rss_mib": 105,
+      "complete_s": 5.89,
+      "repeated_s": [
+        0.318,
+        0.319,
+        0.321,
+        0.339,
+        0.316,
+        0.338,
+        0.327
+      ],
+      "variant": "Rust, result_cache = 16384",
+      "repeated_median_s": 0.321
+    },
+    {
+      "skin": "neowx-material",
+      "engine": "rust",
+      "files": 594,
+      "peak_rss_mib": 130,
+      "complete_s": 9.474,
+      "repeated_s": [
+        1.007,
+        0.977,
+        0.978,
+        0.982,
+        1.057,
+        0.999,
+        0.992
+      ],
+      "variant": "Rust, result_cache = 16384",
+      "repeated_median_s": 0.992
+    },
+    {
+      "skin": "weewx-wdc",
+      "engine": "rust",
+      "files": 275,
+      "peak_rss_mib": 142,
+      "complete_s": 159.706,
+      "repeated_s": [
+        3.342,
+        3.346,
+        3.35,
+        3.329,
+        3.374,
+        3.354,
+        3.96
+      ],
+      "variant": "Rust, result_cache = 16384",
+      "repeated_median_s": 3.35
+    }
+  ]
+}

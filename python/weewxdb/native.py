@@ -4,6 +4,7 @@ import contextvars
 import contextlib
 import datetime
 import hashlib
+import itertools
 import json
 import math
 import sys
@@ -57,6 +58,14 @@ def is_native(provider):
         from .xtypes import NativeXType
         _native_type = NativeXType
     return type(provider) is _native_type
+
+
+_generations = itertools.count()
+
+
+def dispatch_generation():
+    """A small number that changes whenever the registered providers change."""
+    return _cached(('generation',), lambda: next(_generations))
 
 
 def _cached(key, compute):
@@ -383,35 +392,131 @@ def supported_aggregates():
     return _supported[key]
 
 
-RESULT_LIMIT = 4096
+# Default entries per generation; a database keeps at most two generations.
+RESULT_GENERATION = 4096
+# Spans ending this close to the newest record are mostly windows that move
+# with the report time. They are kept per connection and revision only.
+RECENT = 2 * 86400
+# Aggregate results per database file and identity, shared by every
+# connection of this process. WeeWX opens new connections for each report
+# run; results for periods that received no new data remain valid.
+_results = {}
+_results_lock = threading.Lock()
+EVERYTHING = (-2 ** 63, 2 ** 63 - 1)
+
+
+class Generations:
+    """A dictionary that forgets entries not used for about two generations.
+
+    When the current generation is full it becomes the old one, and the
+    previous old generation is dropped. Reading an old entry moves it back to
+    the current generation, so the entries every report run needs survive a
+    complete run that touches many more.
+    """
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.current = {}
+        self.old = {}
+
+    def get(self, key):
+        entry = self.current.get(key)
+        if entry is None:
+            entry = self.old.pop(key, None)
+            if entry is not None:
+                self.put(key, entry)
+        return entry
+
+    def put(self, key, entry):
+        if len(self.current) >= self.limit:
+            self.old = self.current
+            self.current = {}
+        self.current[key] = entry
 
 
 def result_cache(observation, span, aggregate_type, manager, options):
-    """Return the connection's result cache and the key for this aggregate.
+    """Locate this aggregate in the shared result cache.
 
-    A report evaluates many identical aggregates, for example the same
-    monthly maximum in several templates. Results are kept for one committed
-    database revision of the connection and never inside a transaction. The
-    key holds every option that changes the native query.
+    Args:
+        observation (str): The observation type.
+        span (tuple[int|float, int|float]): The time span.
+        aggregate_type (str): The aggregation, in lower case.
+        manager (weewx.manager.Manager): A manager opened with this driver.
+        options (dict): The aggregate's options.
+
+    Returns:
+        tuple|None: A three-way tuple (generations, key, lsn), or None inside a
+            transaction or for another driver.
     """
     connection = manager.connection
     native = getattr(connection, 'native', None)
-    if native is None:
-        return None, None
-    revision = native.revision()
+    revision = native.revision() if native is not None else None
     if revision is None:
-        return None, None
-    state = getattr(connection, '_weewxdb_results', None)
-    if state is None or state[0] != revision or len(state[1]) > RESULT_LIMIT:
-        state = (revision, {})
-        connection._weewxdb_results = state
+        return None
+    # The connection remembers its database's generations; the shared table
+    # is consulted when the database identity changes.
+    limit = getattr(connection, 'result_cache', RESULT_GENERATION)
+    if not limit:
+        return None
+    last = manager.last_timestamp
+    if last is None or span[1] > last - RECENT:
+        recent = connection.__dict__.get('_weewxdb_recent')
+        if recent is None or recent[0] != revision:
+            recent = connection._weewxdb_recent = (revision, Generations(limit))
+        store = recent
+    else:
+        store = connection.__dict__.get('_weewxdb_results')
+        if store is None or store[0] != revision[0]:
+            with _results_lock:
+                generations = _results.get((getattr(connection, 'file_path', None), revision[0]))
+                if generations is None:
+                    generations = _results[(getattr(connection, 'file_path', None), revision[0])] = Generations(limit)
+                generations.limit = max(generations.limit, limit)
+            store = connection._weewxdb_results = (revision[0], generations)
     base = None
     if observation in ['heatdeg', 'cooldeg', 'growdeg']:
         base = repr(options.get('skin_dict', {}).get('Units', {}).get('DegreeDays', {}))
     value = options.get('val')
+    # Daily-summary eligibility depends on whether the span reaches the first
+    # or last record, so those two facts belong to the key.
     key = (manager.table_name, observation, span[0], span[1], aggregate_type, options.get('source', 'auto'),
-           repr(value) if value is not None else None, options.get('fraction'), base, tuple(weewx.xtypes.xtypes))
-    return state[1], key
+           repr(value) if value is not None else None, options.get('fraction'), base,
+           span[0] == manager.first_timestamp, span[1] == manager.last_timestamp, manager.std_unit_system,
+           dispatch_generation())
+    return store[1], key, revision[1]
+
+
+def cached_result(native, generations, key, lsn):
+    """Return the cached ValueTuple for `key` at revision `lsn`, or None."""
+    entry = generations.get(key)
+    if entry is None:
+        return None
+    value, computed, ranges = entry
+    if computed == lsn:
+        return value
+    # A newer revision keeps the result when no transaction since then
+    # changed the time ranges it read. Moving the entry to this revision
+    # makes the next lookup a plain comparison.
+    if computed < lsn and native.unchanged(computed, ranges):
+        generations.put(key, (value, lsn, ranges))
+        return value
+    return None
+
+
+def dependencies(query):
+    """Return the (table, first, last) time ranges a native query reads."""
+    ranges = query.get('ranges')
+    if not ranges or query['mode'] in ['historical', 'xagg_avg']:
+        first, last = EVERYTHING
+    else:
+        # Ranges are ordered and disjoint in every other mode.
+        first = ranges[0][0] - 1
+        last = ranges[-1][1] + 1
+        if query['mode'] == 'weather':
+            # Weather formulas can look back, for example over the rain-rate
+            # or evapotranspiration period.
+            first -= 2 * 86400
+    return ((query['table'], first, last),)
 
 
 def aggregate(observation, span, aggregate_type, manager, **options):
@@ -427,13 +532,16 @@ def aggregate(observation, span, aggregate_type, manager, **options):
     if provider is None:
         # Weather providers can carry state between calls; only stateless
         # queries are cached.
-        cache, key = result_cache(observation, span, aggregate_type, manager, options)
-        if cache is not None and key in cache:
-            return cache[key]
+        lookup = result_cache(observation, span, aggregate_type, manager, options)
+        if lookup is not None:
+            value = cached_result(manager.connection.native, *lookup)
+            if value is not None:
+                return value
         query = query_for(observation, span, aggregate_type, manager, options)
         value = finish_aggregate(observation, aggregate_type, manager, query, request(manager, query))
-        if cache is not None:
-            cache[key] = value
+        if lookup is not None:
+            generations, key, lsn = lookup
+            generations.put(key, (value, lsn, dependencies(query)))
         return value
     with provider_lock(provider):
         query = query_for(observation, span, aggregate_type, manager, options)

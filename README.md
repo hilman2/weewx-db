@@ -46,9 +46,10 @@ the whole process.
 
 **Classic skins render faster without changes.** Seasons, Belchertown,
 Neowx-Material and Weather Data Center regenerate their pages after each
-archive interval 7 to 31 percent faster than on SQLite. A complete first
-generation is 11 to 18 percent faster. Record queries such as the wettest or
-warmest day answer two to eight times faster than SQLite.
+archive record 15 to 35 percent faster than on SQLite. Report runs reuse the
+index, journal and statistics of earlier runs for periods without new data.
+A complete first generation is 11 to 18 percent faster. Record queries such
+as the wettest or warmest day answer two to eight times faster than SQLite.
 
 The measurements behind these numbers, with raw reports and reproduction
 commands, are in [results/README.md](results/README.md).

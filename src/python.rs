@@ -204,6 +204,18 @@ impl PyConnection {
         }).map_err(py_error)
     }
 
+    /// Whether no transaction after revision `since` changed any of the
+    /// `(table, first, last)` time ranges. False inside a transaction.
+    fn unchanged(&self, py: Python<'_>, since: u64, ranges: Vec<(String,i64,i64)>) -> PyResult<bool> {
+        py.detach(|| -> Result<bool> {
+            let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
+            session.refresh()?;
+            if session.in_transaction() { return Ok(false); }
+            let store = crate::sql::guard(&session.store)?;
+            Ok(ranges.iter().all(|(table, first, last)| store.unchanged_since(since, table, *first, *last)))
+        }).map_err(py_error)
+    }
+
     fn analytics(&self, py: Python<'_>, specification: String) -> PyResult<String> {
         let query: crate::analytics::Query = serde_json::from_str(&specification).map_err(py_error)?;
         py.detach(|| -> Result<String> {

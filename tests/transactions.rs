@@ -291,6 +291,8 @@ fn background_sync_recovers_only_the_last_torn_transaction() {
     let first_start = schema_start+16+schema_size;
     wal[first_start+16] ^= 1;
     std::fs::write(sidecar(&path,".wal"),wal).unwrap();
+    // A process verifies each frame once; the damage is found by a new one.
+    weewx_db::store::forget_replayed_journal(&path);
     assert!(Session::open(&path,0).is_err());
 }
 
