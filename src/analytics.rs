@@ -157,7 +157,7 @@ impl Store {
             &&matches!(query.aggregate.as_str(),"sum"|"avg"|"count"|"min"|"max"|"not_null") {
             let (start,stop)=query.ranges[0];
             let stats=self.aggregate(&query.table,&query.observation,Span{start,stop,daily:false})?;
-            let integer=self.columns(&query.table)?.iter().find(|c|c.name==query.observation).is_some_and(|c|c.kind==Kind::Integer);
+            let integer=self.column_defs(&query.table)?.iter().find(|c|c.name==query.observation).is_some_and(|c|c.kind==Kind::Integer);
             ensure!(!integer||matches!(query.aggregate.as_str(),"count"|"not_null")||![stats.min,stats.max,stats.sum].into_iter().flatten().any(|n|n.abs()>=(1_u64<<53)as f64),"integer precision requires SQL");
             let value=match query.aggregate.as_str(){
                 "count"=>json!(stats.count),"not_null"=>json!(stats.count>0),
@@ -166,6 +166,8 @@ impl Store {
             };
             return Ok(Answer{values:vec![value],rows:vec![stats.count],units:vec![query.unit_system],..Answer::default()});
         }
+        if query.mode == "daily" && query.ranges.len() == 1 && query.threshold.is_none()
+            && let Some(answer) = self.daily_summary_analytics(query)? { return Ok(answer); }
         if query.mode == "daily" || query.mode == "historical" || query.mode == "degree" || query.mode == "xagg_avg" {
             return self.daily_analytics(query);
         }
@@ -188,7 +190,7 @@ impl Store {
         if query.source == "fill_missing" { names.push(query.observation.clone()); }
         let columns = indices(self,&query.table,&names)?;
         if query.weather.is_none() { ensure!(columns[0].is_some(),"unknown observation"); }
-        if query.weather.is_none()&&self.columns(&query.table)?[columns[0].unwrap()].kind==Kind::Integer {
+        if query.weather.is_none()&&self.column_defs(&query.table)?[columns[0].unwrap()].kind==Kind::Integer {
             let stats=self.aggregate(&query.table,&query.observation,Span{start:query.ranges[0].0,stop:query.ranges.last().unwrap().1,daily:false})?;
             ensure!(![stats.min,stats.max,stats.sum].into_iter().flatten().any(|n|n.abs()>=(1_u64<<53)as f64),"integer precision requires SQL");
         }
@@ -238,6 +240,35 @@ impl Store {
         }
         answer.rows = reductions.iter().map(|r|r.rows).collect(); answer.units = units; answer.state = state.finish();
         Ok(answer)
+    }
+
+    /// Simple reductions of one daily-summary range, answered from block
+    /// summaries like the SQL aggregate path. None leaves the query to
+    /// `daily_analytics`.
+    fn daily_summary_analytics(&mut self, query: &Query) -> Result<Option<Answer>> {
+        let names: &[&str] = match query.aggregate.as_str() {
+            "min" => &["min"], "max" => &["max"], "sum" => &["sum"],
+            "count" | "not_null" => &["count"], "avg" => &["wsum", "sumtime"], _ => return Ok(None),
+        };
+        let columns = self.column_defs(&query.table)?;
+        if !names.iter().all(|name| columns.iter().any(|c| c.name == *name)) {
+            return Ok(None);
+        }
+        let (start, stop) = query.ranges[0];
+        let span = Span { start, stop, daily: true };
+        let days = self.aggregate(&query.table, "dateTime", span)?;
+        let stats = names.iter().map(|name| self.aggregate(&query.table, name, span)).collect::<Result<Vec<_>>>()?;
+        let a = &stats[0];
+        let value = match query.aggregate.as_str() {
+            "not_null" => if days.count == 0 { Json::Null } else { json!(a.max.is_some_and(|v| v > 0.0)) },
+            "avg" => a.sum.zip(stats[1].sum).and_then(|(a, b)| (b != 0.0).then_some(a / b)).map_or(Json::Null, |v| json!(v)),
+            "count" => a.sum.map_or(Json::Null, |v| json!(v as i64)),
+            "min" => a.min.map_or(Json::Null, |v| json!(v)),
+            "max" => a.max.map_or(Json::Null, |v| json!(v)),
+            _ => a.sum.map_or(Json::Null, |v| json!(v)),
+        };
+        Ok(Some(Answer { values: vec![value], rows: vec![days.count], units: vec![query.unit_system],
+            starts: vec![days.min.map_or(0, |v| v as i64)], stops: vec![days.max.map_or(0, |v| v as i64)], state: Json::Null }))
     }
 
     fn daily_analytics(&mut self, query: &Query) -> Result<Answer> {

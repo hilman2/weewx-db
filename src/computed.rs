@@ -129,7 +129,7 @@ impl Store {
         // Overlay rows replace base values before the nonlinear formula runs.
         // Aggregating input columns first would change the result.
         if let Some(changes) = changes {
-            for (&time,row) in changes {
+            for (&time,row) in changes.iter() {
                 if span.before(time) || span.after(time) { continue; }
                 if let Some(row) = row {
                     if let Some(ci) = projection.units { ensure!(row[ci] == Cell::Integer(source.unit_system),"unit system changes within computed series"); }
@@ -194,7 +194,7 @@ impl Store {
 
     pub fn computed_raw(&mut self, table: &str, source: &Computed, start: i64, stop: i64) -> Result<(Vec<i64>,Vec<i64>,Vec<Cell>)> {
         let projection = self.projection(table,source,true)?;
-        let interval = self.columns(table)?.iter().position(|c|c.name == "interval").context("interval column missing")?;
+        let interval = self.column_defs(table)?.iter().position(|c|c.name == "interval").context("interval column missing")?;
         let mut cursor = RowCursor::new(self,table,Span {start,stop,daily:false})?;
         let mut starts = Vec::new(); let mut stops = Vec::new(); let mut values = Vec::new();
         while cursor.advance(self)? {

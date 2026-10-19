@@ -17,7 +17,7 @@ def astronomy(timestamp, latitude, longitude, elevation=0.0, body='sun',
     return _weewxdb.astronomy_native({
         'time': timestamp, 'latitude': latitude, 'longitude': longitude, 'elevation': elevation,
         'body': body, 'pressure': pressure, 'temperature': temperature, 'horizon': horizon,
-        'operation': operation, 'start': start, 'stop': stop, 'center': center})
+        'operation': operation, 'start': start, 'stop': stop, 'center': bool(center)})
 
 
 class Error(Exception):
@@ -117,30 +117,39 @@ class Cursor:
     def __init__(self, connection):
         self.connection = connection
         self.arraysize = 200
-        self.description = None
         self.rowcount = -1
         self.lastrowid = None
         self._native = None
         self._closed = False
+        self._buffer = []
+        self._position = 0
+
+    @property
+    def description(self):
+        if self._native is None:
+            return None
+        return [(name, None, None, None, None, None, None) for name in self._native.columns] or None
 
     def execute(self, sql, parameters=()):
         if self._closed or self.connection._closed:
             raise ProgrammingError('Cursor or connection is closed')
         if self._native is not None:
             _call(self._native.close)
-        words = re.sub(r'\A(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)*', '',
-                       sql, flags=re.DOTALL).split(None, 1)
-        if not words:
+            self._native = None
+        self._buffer = []
+        self._position = 0
+        if not sql.strip():
             raise ProgrammingError('SQL statement is empty')
-        keyword = words[0].upper()
-        if not self.connection.autocommit and not self.connection._in_transaction \
-                and keyword in ['INSERT', 'UPDATE', 'DELETE', 'REPLACE']:
-            self.connection.execute('BEGIN').close()
+        if not self.connection.autocommit and not self.connection._in_transaction:
+            words = re.sub(r'\A(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)*', '',
+                           sql, flags=re.DOTALL).split(None, 1)
+            if not words:
+                raise ProgrammingError('SQL statement is empty')
+            if words[0].upper() in ['INSERT', 'UPDATE', 'DELETE', 'REPLACE']:
+                self.connection.execute('BEGIN').close()
         self._native = _call(self.connection.native.execute, sql, tuple(parameters))
-        self.description = [(name, None, None, None, None, None, None)
-                            for name in self._native.columns] or None
         self.rowcount = self._native.rowcount
-        self.connection._in_transaction = self.connection.native.in_transaction
+        self.connection._in_transaction = self._native.in_transaction
         return self
 
     def executemany(self, sql, parameters):
@@ -161,21 +170,34 @@ class Cursor:
         self.rowcount = count
         return self
 
+    # Rows already fetched for iteration are served before the native cursor.
+    def _take_buffer(self, size):
+        rows = self._buffer[self._position:self._position + size]
+        self._position += len(rows)
+        if self._position >= len(self._buffer):
+            self._buffer = []
+            self._position = 0
+        return rows
+
     def fetchone(self):
         self._check_result()
+        if self._buffer:
+            return self._take_buffer(1)[0]
         return _call(self._native.fetchone)
 
     def fetchmany(self, size=None):
         self._check_result()
-        return _call(self._native.fetchmany, self.arraysize if size is None else size)
+        size = self.arraysize if size is None else size
+        rows = self._take_buffer(size) if self._buffer else []
+        if len(rows) < size:
+            rows.extend(_call(self._native.fetchmany, size - len(rows)))
+        return rows
 
     def fetchall(self):
-        result = []
-        while True:
-            rows = self.fetchmany()
-            if not rows:
-                return result
-            result.extend(rows)
+        self._check_result()
+        rows = self._take_buffer(len(self._buffer)) if self._buffer else []
+        rows.extend(_call(self._native.fetchall))
+        return rows
 
     def _check_result(self):
         if self._closed or self.connection._closed or self._native is None:
@@ -185,15 +207,24 @@ class Cursor:
         if not self._closed:
             if self._native is not None:
                 _call(self._native.close)
+            self._buffer = []
             self._closed = True
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        row = self.fetchone()
-        if row is None:
-            raise StopIteration
+        if not self._buffer:
+            self._check_result()
+            self._buffer = _call(self._native.fetchmany, self.arraysize)
+            self._position = 0
+            if not self._buffer:
+                raise StopIteration
+        row = self._buffer[self._position]
+        self._position += 1
+        if self._position >= len(self._buffer):
+            self._buffer = []
+            self._position = 0
         return row
 
     def __enter__(self):

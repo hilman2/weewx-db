@@ -341,8 +341,9 @@ fn stored_column(values: &[Option<u64>]) -> (Vec<u8>,bool) {
     if compressed.len()+16 < raw.len() { (compressed,true) } else { (raw,false) }
 }
 
+/// An empty block stands for a column whose rows are all NULL.
 fn bits(bytes: &[u8], rows: usize, i: usize) -> Option<u64> {
-    if bytes[i / 8] & (1 << (i % 8)) == 0 {
+    if bytes.is_empty() || bytes[i / 8] & (1 << (i % 8)) == 0 {
         return None;
     }
     let start = rows.div_ceil(8) + i * 8;
@@ -360,6 +361,11 @@ fn number(bytes: &[u8], rows: usize, i: usize, kind: Kind) -> Option<f64> {
 
 fn timestamp(bytes: &[u8], rows: usize, i: usize) -> i64 {
     bits(bytes, rows, i).unwrap() as i64
+}
+
+fn null_column() -> Arc<[u8]> {
+    static EMPTY: std::sync::OnceLock<Arc<[u8]>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::from(Vec::new())).clone()
 }
 
 fn new_id() -> Result<String> {
@@ -680,11 +686,12 @@ impl Database {
             let default = self.manifest.tables[ti].columns[ci].default.as_ref().and_then(|c| match c {
                 Cell::Integer(n) => Some(*n as u64), Cell::Real(n) => Some(*n), _ => None,
             });
+            if default.is_none() { return Ok(null_column()); }
             return Ok(encode_full(&vec![default; block.rows]).into());
         }
         let column = &block.columns[ci];
         if column.length == 0 {
-            return Ok(vec![0; block_bytes(block.rows)].into());
+            return Ok(null_column());
         }
         if let Some(bytes) = self.cache.get(&column.offset) {
             return Ok(bytes.clone());
@@ -738,8 +745,11 @@ impl Database {
             let times = self.load(ti, bi, ts)?;
             // Timestamps participate in binary search, so a NULL timestamp must
             // be rejected even when the affected measurement itself is NULL.
+            // A block summary counting every row already proves that.
+            let summarized = self.manifest.tables[ti].blocks[bi].columns.get(ts)
+                .and_then(|c| c.stats.as_ref()).is_some_and(|s| s.count == n as u64);
             ensure!(
-                (0..n).all(|i| bits(&times, n, i).is_some()),
+                summarized || (0..n).all(|i| bits(&times, n, i).is_some()),
                 "NULL timestamp"
             );
             let mut lower = 0;
@@ -765,18 +775,23 @@ impl Database {
     }
 
     pub fn aggregate(&mut self, table: &str, column: &str, span: Span) -> Result<Stats> {
-        self.aggregate_excluding(table, column, span, &std::collections::BTreeSet::new())
+        self.aggregate_excluding::<()>(table, column, span, None)
     }
 
-    fn aggregate_excluding(&mut self, table: &str, column: &str, span: Span, excluded: &std::collections::BTreeSet<i64>) -> Result<Stats> {
+    /// Rows whose timestamps are keys of `excluded` are left out; the journal
+    /// supplies their current values.
+    fn aggregate_excluding<V>(&mut self, table: &str, column: &str, span: Span, excluded: Option<&std::collections::BTreeMap<i64, V>>) -> Result<Stats> {
         ensure!(span.start <= span.stop, "reversed time span");
         let (ti, ci, ts) = self.table_column(table, column)?;
         let mut answer = Accumulator::default();
-        for bi in 0..self.manifest.tables[ti].blocks.len() {
+        let excluded = excluded.filter(|e| !e.is_empty());
+        let blocks = &self.manifest.tables[ti].blocks;
+        let first = blocks.partition_point(|b| span.before(b.last));
+        let stop = blocks.partition_point(|b| !span.after(b.first));
+        for bi in first..stop {
             let block = &self.manifest.tables[ti].blocks[bi];
-            if span.before(block.last) || span.after(block.first) { continue; }
             if !span.before(block.first) && !span.after(block.last)
-                && excluded.range(block.first..=block.last).next().is_none()
+                && excluded.is_none_or(|e| e.range(block.first..=block.last).next().is_none())
                 && let Some(stats) = self.block_summary(ti,bi,ci) {
                 answer.merge(&stats);
                 self.metrics.synopsis_hits += 1;
@@ -788,7 +803,7 @@ impl Database {
             let values = self.load(ti, bi, ci)?;
             for i in 0..n {
                 let time = timestamp(&times, n, i);
-                if !span.before(time) && !span.after(time) && !excluded.contains(&time) {
+                if !span.before(time) && !span.after(time) && !excluded.is_some_and(|e| e.contains_key(&time)) {
                     answer.add(number(&values, n, i, kind));
                 }
             }

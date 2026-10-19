@@ -14,5 +14,17 @@
   "ephem-source": {
     "repository": "https://github.com/brandon-rhodes/pyephem.git",
     "revision": "6be1e55540fd32aaeff272733190128155e8a35c"
+  },
+  "belchertown-source": {
+    "repository": "https://github.com/poblabs/weewx-belchertown.git",
+    "revision": "049f615952da8d9e0c779ccab9e6f64cf88fedf6"
+  },
+  "neowx-material-source": {
+    "repository": "https://github.com/neoground/neowx-material.git",
+    "revision": "1a09af0052b25a1d4a8a0877b02b89868cd8a307"
+  },
+  "wdc-source": {
+    "repository": "https://github.com/Daveiano/weewx-wdc.git",
+    "revision": "4634c248fefa6d68d90ccbb723a84a0ba24fa655"
   }
 }

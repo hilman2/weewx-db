@@ -1,0 +1,155 @@
+{
+  "date": "2026-10-19",
+  "platform": "Linux-7.0.0-38-generic-x86_64-with-glibc2.43",
+  "python": "3.14.4",
+  "archive": "tools/station_fixture.py, ten years, 1,051,200 five-minute records, wview_extended schema",
+  "skins": {
+    "weewx-source": {
+      "repository": "https://github.com/hilman2/weewx.git",
+      "revision": "def717274ef07da1910f9a0975f8d76ed287aa47"
+    },
+    "belchertown-source": {
+      "repository": "https://github.com/poblabs/weewx-belchertown.git",
+      "revision": "049f615952da8d9e0c779ccab9e6f64cf88fedf6"
+    },
+    "neowx-material-source": {
+      "repository": "https://github.com/neoground/neowx-material.git",
+      "revision": "1a09af0052b25a1d4a8a0877b02b89868cd8a307"
+    },
+    "wdc-source": {
+      "repository": "https://github.com/Daveiano/weewx-wdc.git",
+      "revision": "4634c248fefa6d68d90ccbb723a84a0ba24fa655"
+    }
+  },
+  "execution": "One process per skin and engine, each pinned to its own physical core (taskset 2-9). One complete run into an empty output directory, then seven repeated runs with the same generation time. Forecast, AQI, earthquake and MQTT features of Belchertown disabled.",
+  "runs": [
+    {
+      "skin": "Belchertown",
+      "engine": "rust",
+      "files": 190,
+      "complete_s": 5.986,
+      "repeated_s": [
+        0.382,
+        0.369,
+        0.392,
+        0.39,
+        0.378,
+        0.366,
+        0.367
+      ],
+      "repeated_median_s": 0.378
+    },
+    {
+      "skin": "Belchertown",
+      "engine": "sqlite",
+      "files": 190,
+      "complete_s": 7.217,
+      "repeated_s": [
+        0.401,
+        0.401,
+        0.421,
+        0.445,
+        0.406,
+        0.423,
+        0.404
+      ],
+      "repeated_median_s": 0.406
+    },
+    {
+      "skin": "Seasons",
+      "engine": "rust",
+      "files": 193,
+      "complete_s": 2.423,
+      "repeated_s": [
+        0.329,
+        0.322,
+        0.354,
+        0.326,
+        0.323,
+        0.326,
+        0.327
+      ],
+      "repeated_median_s": 0.326
+    },
+    {
+      "skin": "Seasons",
+      "engine": "sqlite",
+      "files": 193,
+      "complete_s": 2.961,
+      "repeated_s": [
+        0.484,
+        0.478,
+        0.472,
+        0.472,
+        0.452,
+        0.447,
+        0.463
+      ],
+      "repeated_median_s": 0.472
+    },
+    {
+      "skin": "neowx-material",
+      "engine": "rust",
+      "files": 594,
+      "complete_s": 9.369,
+      "repeated_s": [
+        1.02,
+        1.025,
+        1.042,
+        1.03,
+        1.035,
+        1.036,
+        1.026
+      ],
+      "repeated_median_s": 1.03
+    },
+    {
+      "skin": "neowx-material",
+      "engine": "sqlite",
+      "files": 594,
+      "complete_s": 10.671,
+      "repeated_s": [
+        1.164,
+        1.181,
+        1.174,
+        1.174,
+        1.157,
+        1.171,
+        1.182
+      ],
+      "repeated_median_s": 1.174
+    },
+    {
+      "skin": "weewx-wdc",
+      "engine": "rust",
+      "files": 275,
+      "complete_s": 153.688,
+      "repeated_s": [
+        3.318,
+        3.34,
+        3.371,
+        3.34,
+        3.369,
+        3.329,
+        3.388
+      ],
+      "repeated_median_s": 3.34
+    },
+    {
+      "skin": "weewx-wdc",
+      "engine": "sqlite",
+      "files": 275,
+      "complete_s": 172.996,
+      "repeated_s": [
+        3.882,
+        3.861,
+        3.84,
+        3.895,
+        3.88,
+        3.864,
+        3.891
+      ],
+      "repeated_median_s": 3.88
+    }
+  ]
+}

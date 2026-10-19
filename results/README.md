@@ -8,6 +8,83 @@ five-minute records, 32 observation columns and 16 active sensors. The host
 is Linux x86_64 on an AMD Ryzen AI 9 HX 470 with NVMe storage, Rust 1.99.0
 and Python 3.13.16. They are not Raspberry Pi measurements.
 
+## Report skins, 19 October 2026
+
+These runs generate complete reports with the four skins below, through
+WeeWX's report engine, once on SQLite and once on the Rust driver. The archive
+comes from `tools/station_fixture.py`: ten years of five-minute records in the
+`wview_extended` schema, 1,051,200 records with daily summaries. Seasons comes
+with the pinned WeeWX source; the other skins are pinned in
+[references.json](../references.json). The host is the same as below, with
+Python 3.14.
+
+Each skin and engine runs in its own process on its own physical core. The
+complete run writes into an empty output directory, including every monthly
+and yearly summary page. The seven repeated runs use the same generation time,
+as WeeWX does after every archive interval, and regenerate only the current
+pages. Belchertown's forecast, AQI, earthquake and MQTT features are off.
+Times in seconds; repeated runs are medians:
+
+| Skin | Files | SQLite complete | Rust complete | SQLite repeated | Rust repeated |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Seasons | 193 | 2.961 | 2.423 | 0.472 | 0.326 |
+| Belchertown | 190 | 7.217 | 5.986 | 0.406 | 0.378 |
+| Neowx-Material | 594 | 10.671 | 9.369 | 1.174 | 1.030 |
+| Weather Data Center | 275 | 172.996 | 153.688 | 3.880 | 3.340 |
+
+Profiles of the repeated runs put most of the remaining time in template
+rendering and in the skins' own Python code. Weather Data Center spends most
+of its time in a table builder that searches its own rows for every value.
+The [raw report](v3-skins.json) lists every sample.
+
+The same measurement found two compatibility faults that these numbers
+include as fixed. Templates that call `sun(use_center=1)` failed in the
+almanac adapter, which only accepted a boolean. Belchertown reads
+`database_type` from the database entry to choose its SQL dialect; the
+extension's entry did not set it.
+
+## Per-query costs, 19 October 2026
+
+A query's fixed cost covers the check for changes by other connections, SQL
+preparation and the Python DB-API. These medians are on CPU 6, as in the
+sections below, through `weewxdb.connect`:
+
+| Statement | Before | After |
+| --- | ---: | ---: |
+| `SELECT 1`, native call | 6.5 µs | 1.2 µs |
+| `SELECT 1`, DB-API with fetch and close | 11.0 µs | 3.1 µs |
+| `MAX(dateTime)` over the archive | 15.3 µs | 2.7 µs |
+| One complete archive record by `dateTime` | 33.1 µs | 6.8 µs |
+
+Reading a record no longer allocates a zeroed buffer for every all-NULL
+column. A read checks one file for changes instead of opening the lock file
+and checking three files. Prepared statements and their analysis are reused
+for the same SQL text.
+
+The daily-record queries of the [earlier comparison](#finding-daily-records)
+now run on the virtual table's ordered paths. ORDER BY on a column with LIMIT
+keeps the best rows while skipping blocks whose summaries cannot reach them.
+ORDER BY on a computed expression, such as `wsum/sumtime`, is evaluated
+natively with SQLite's arithmetic rules. Warm medians of 101 queries, ms:
+
+| Query | SQLite | Rust backend |
+| --- | ---: | ---: |
+| Wettest day | 0.236 | 0.093 |
+| Warmest mean day | 0.286 | 0.105 |
+| Highest temperature day | 0.215 | 0.027 |
+
+Repeated identical aggregates within one report, such as the same monthly
+maximum in several templates, are answered from a per-connection cache for the
+current database revision. Writes, other connections' commits and open
+transactions bypass or reset it. A repeated `$month.outTemp.max` then takes
+2.6 µs instead of 11.9 µs on SQLite.
+
+The JSON generator's idle run, with no new data, takes 2.0 ms instead of
+2.8 ms on SQLite with the 128 MiB cache. Its incremental update remains equal.
+Sun and Moon positions match PyEphem's time within one percent. Fetching the
+newest record or the first and last timestamps through WeeWX's manager stays
+within one microsecond of SQLite.
+
 ## Complete JSON generation
 
 The JSON generator and its WeeWX dependencies come from
@@ -333,8 +410,10 @@ with a 128 MiB cache are:
 | Warmest mean day | 0.313 | 1.385 |
 | Highest temperature day | 0.188 | 0.814 |
 
-SQLite is currently faster for these small ORDER BY/LIMIT queries. They use
-existing summaries and do not regroup every archive row. The original fixture
+SQLite was faster for these small ORDER BY/LIMIT queries in this measurement.
+They use existing summaries and do not regroup every archive row. The
+[per-query section](#per-query-costs-19-october-2026) shows the current
+ordered paths. The original fixture
 contains only outTemp daily summaries. Rain daily sums were added to temporary
 copies of both databases before timing, using UTC archive-day boundaries.
 That preparation is excluded from the query times. Results matched exactly
@@ -410,6 +489,22 @@ PYTHONPATH=build/weewx-db-trial/json-source/src python3 \
 
 Use a checkout containing the JSON generator through PYTHONPATH to compare
 another source revision. The benchmark does not install or alter that source.
+
+The skin runs need Cheetah3, and on Python 3.13 or later also legacy-cgi.
+Run each skin and engine in its own process:
+
+```sh
+python3 -m pip install Cheetah3 legacy-cgi
+PYTHONPATH=build/weewx-db-trial/weewx-source/src python3 \
+    tools/station_fixture.py build/station.sdb
+target/release/weewx-db import build/station.sdb build/station.wwdb
+for skin in Seasons Belchertown neowx-material weewx-wdc; do
+    for engine in sqlite rust; do
+        PYTHONPATH=build/weewx-db-trial/weewx-source/src python3 tools/bench_skins.py \
+            $engine $skin build/station.sdb build/station.wwdb --runs 7
+    done
+done
+```
 
 The earlier read-only, uncompressed prototype's reports remain available:
 [no cache](desktop-0mib.json), [1 MiB](desktop-1mib.json),

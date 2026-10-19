@@ -41,7 +41,7 @@ impl PyConnection {
     fn execute(&self, py: Python<'_>, sql: String, parameters: Option<Vec<Py<PyAny>>>) -> PyResult<PyCursor> {
         let parameters = parameters.unwrap_or_default().iter().map(|v|from_python(v.bind(py))).collect::<PyResult<Vec<_>>>()?;
         let cursor = py.detach(||Cursor::open(self.session.clone(),&sql,&parameters)).map_err(py_error)?;
-        Ok(PyCursor { cursor:Mutex::new(cursor) })
+        Ok(PyCursor { columns: cursor.columns.clone(), rowcount: cursor.rowcount, in_transaction: cursor.in_transaction, cursor:Mutex::new(cursor) })
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
@@ -219,17 +219,33 @@ fn computed_source((formula,inputs,unit_system): ComputationSpec) -> PyResult<Co
     Ok(Computed {formula:formula.parse().map_err(py_error)?,temperature:inputs.0,humidity:inputs.1,unit_system})
 }
 
+/// Result metadata is fixed when the statement runs, so it is kept as plain
+/// attributes that Python reads without a call into the cursor.
 #[pyclass(name="Cursor",module="_weewxdb")]
-struct PyCursor { cursor: Mutex<Cursor> }
+struct PyCursor {
+    cursor: Mutex<Cursor>,
+    #[pyo3(get)] columns: Vec<String>,
+    #[pyo3(get)] rowcount: i64,
+    #[pyo3(get)] in_transaction: bool,
+}
 
 #[pymethods]
 impl PyCursor {
     #[getter]
-    fn columns(&self) -> PyResult<Vec<String>> { Ok(self.cursor.lock().map_err(|_|py_error("cursor mutex poisoned"))?.columns.clone()) }
-    #[getter]
-    fn rowcount(&self) -> PyResult<i64> { Ok(self.cursor.lock().map_err(|_|py_error("cursor mutex poisoned"))?.rowcount) }
-    #[getter]
     fn engine(&self) -> PyResult<String> { Ok(self.cursor.lock().map_err(|_|py_error("cursor mutex poisoned"))?.engine.clone()) }
+
+    fn fetchall(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let list = PyList::empty(py);
+        loop {
+            let rows = py.detach(||self.cursor.lock().map_err(|_|py_error("cursor mutex poisoned"))?.fetchmany(1024).map_err(py_error))?;
+            if rows.is_empty() { break; }
+            for row in rows {
+                let cells = row.iter().map(|v|to_python(py,v)).collect::<PyResult<Vec<_>>>()?;
+                list.append(PyTuple::new(py,cells)?)?;
+            }
+        }
+        Ok(list.into_any().unbind())
+    }
 
     #[pyo3(signature=(size=200))]
     fn fetchmany(&self, py: Python<'_>, size: usize) -> PyResult<Py<PyAny>> {

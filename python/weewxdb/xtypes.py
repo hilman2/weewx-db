@@ -8,6 +8,8 @@ import weewx.units
 import weewx.xtypes
 import weewx.wxxtypes
 
+from . import native as calculations
+
 
 def computed_specification(obs_type, db_manager):
     definitions = {'dewpoint': ('dewpoint', ('outTemp', 'outHumidity')),
@@ -54,9 +56,8 @@ def computed_call(function, *args):
 
 
 def register():
-    from . import native
     from . import almanac
-    native.register_units()
+    calculations.register_units()
     almanac.register()
     if not any(isinstance(xtype, NativeXType) for xtype in weewx.xtypes.xtypes):
         weewx.xtypes.xtypes.insert(0, NativeXType())
@@ -64,12 +65,10 @@ def register():
 
 class NativeXType(weewx.xtypes.XType):
     def get_scalar(self, obs_type, record, db_manager=None, **options):
-        from . import native
-        return native.scalar(obs_type, record, db_manager)
+        return calculations.scalar(obs_type, record, db_manager)
 
     def get_series(self, obs_type, timespan, db_manager, aggregate_type=None,
                    aggregate_interval=None, **options):
-        from . import native as calculations
         try:
             return calculations.series(obs_type, timespan, db_manager, aggregate_type,
                                        aggregate_interval, **options)
@@ -138,7 +137,6 @@ class NativeXType(weewx.xtypes.XType):
                 weewx.units.ValueTuple(values, unit, group))
 
     def get_aggregate(self, obs_type, timespan, aggregate_type, db_manager, **options):
-        from . import native as calculations
         observation, source = calculations.report_source.get()
         if obs_type == observation and source != 'auto':
             options = dict(options, source=source)

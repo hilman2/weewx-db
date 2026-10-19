@@ -21,14 +21,14 @@ impl Source {
     }
     fn kind(&self, store: &Store, table: &str) -> Result<Kind> {
         match self {
-            Self::Column(column)=>Ok(store.columns(table)?.iter().find(|c|c.name==*column).context("no such column")?.kind),
+            Self::Column(column)=>Ok(store.column_defs(table)?.iter().find(|c|c.name==*column).context("no such column")?.kind),
             Self::Computed(_)=>Ok(Kind::Real),
         }
     }
 }
 
 fn source(store: &Store, table: &str, expr: &Expr) -> Result<Option<Source>> {
-    let columns = store.columns(table)?;
+    let columns = store.column_defs(table)?;
     let column = |expr:&Expr|identifier(expr).and_then(|name|columns.iter().find(|c|c.name.eq_ignore_ascii_case(name))).map(|c|c.name.clone());
     if let Some(column) = column(expr) { return Ok(Some(Source::Column(column))); }
     let Expr::Function(f) = expr else { return Ok(None) };
@@ -49,8 +49,323 @@ fn source(store: &Store, table: &str, expr: &Expr) -> Result<Option<Source>> {
 }
 
 pub(super) fn query(store: &mut Store, statement: &Statement, parameters: &[Cell]) -> Result<Option<Vec<Vec<Cell>>>> {
+    if let Some(rows) = ordered(store,statement,parameters)? { return Ok(Some(rows)); }
     if let Some(row) = aggregate(store,statement,parameters)? { return Ok(Some(vec![row])); }
     grouped(store,statement,parameters)
+}
+
+/// Answer `SELECT ... FROM table [WHERE ...] ORDER BY expression [, dateTime]
+/// LIMIT n [OFFSET m]` when the sort key is computed from columns, such as
+/// the warmest mean day `wsum/sumtime`. SQLite cannot pass such an order to
+/// the virtual table and would deliver and sort every row.
+fn ordered(store: &mut Store, statement: &Statement, parameters: &[Cell]) -> Result<Option<Vec<Vec<Cell>>>> {
+    use sqlparser::ast::LimitClause;
+    let Statement::Query(query) = statement else { return Ok(None) };
+    let SetExpr::Select(select) = query.body.as_ref() else { return Ok(None) };
+    if query.with.is_some() || select.from.len() != 1 || !select.from[0].joins.is_empty() || select.having.is_some()
+        || select.distinct.is_some() || !select.named_window.is_empty() || select.qualify.is_some()
+        || !matches!(&select.group_by, GroupByExpr::Expressions(e, _) if e.is_empty()) { return Ok(None); }
+    let TableFactor::Table { name, args: None, .. } = &select.from[0].relation else { return Ok(None) };
+    let Ok(ti) = store.table_index(&vtab::dequote(&name.to_string())) else { return Ok(None) };
+    let table = store.snapshot.manifest.tables[ti].name.clone();
+    let columns = store.snapshot.manifest.tables[ti].columns.clone();
+    let ts = columns.iter().position(|c| c.name == "dateTime").context("dateTime missing")?;
+    let Some(order) = &query.order_by else { return Ok(None) };
+    let OrderByKind::Expressions(orders) = &order.kind else { return Ok(None) };
+    if orders.is_empty() || orders.len() > 2 || orders.iter().any(|o| o.with_fill.is_some() || o.options.nulls_first.is_some()) { return Ok(None); }
+    // Projection and ORDER BY take no parameters; WHERE, LIMIT and OFFSET take
+    // them in this text order.
+    let mut constant = Binder { parameters: None, positional: 0 };
+    let mut projection = Vec::new();
+    let mut aliases = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => for ci in 0..columns.len() { projection.push(Term::Column(ci)); aliases.push(None); },
+            SelectItem::UnnamedExpr(expr) => { let Some(term) = Term::compile(expr, &columns, &mut constant) else { return Ok(None) }; projection.push(term); aliases.push(None); }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let Some(term) = Term::compile(expr, &columns, &mut constant) else { return Ok(None) };
+                projection.push(term); aliases.push(Some((alias.value.clone(), expr)));
+            }
+            _ => return Ok(None),
+        }
+    }
+    // ORDER BY resolves a result alias or a result number before a column.
+    let key_expr = &orders[0].expr;
+    let key = if let Some(position) = integer(key_expr, &[], &mut 0).filter(|n| *n >= 1) {
+        let Some(Some((_, expr))) = aliases.get(position as usize - 1) else { return Ok(None) };
+        Term::compile(expr, &columns, &mut constant)
+    } else if let Some((_, expr)) = identifier(key_expr).and_then(|name| aliases.iter().flatten().find(|(alias, _)| alias.eq_ignore_ascii_case(name))) {
+        Term::compile(expr, &columns, &mut constant)
+    } else { Term::compile(key_expr, &columns, &mut constant) };
+    // A plain column order is answered faster by the virtual table, which
+    // can skip whole blocks by their summaries.
+    let Some(key) = key.filter(|k| !matches!(k, Term::Column(_))) else { return Ok(None) };
+    let descending = orders[0].options.asc == Some(false);
+    let later_first = match orders.get(1) {
+        None => false,
+        Some(o) if identifier(&o.expr).is_some_and(|n| n.eq_ignore_ascii_case("dateTime")) => o.options.asc == Some(false),
+        Some(_) => return Ok(None),
+    };
+    let mut binder = Binder { parameters: Some(parameters), positional: 0 };
+    let mut filters = Vec::new();
+    if let Some(selection) = &select.selection && !conditions(selection, &columns, &mut binder, &mut filters) { return Ok(None); }
+    let (limit, offset) = match &query.limit_clause {
+        Some(LimitClause::LimitOffset { limit: Some(limit), offset, limit_by }) if limit_by.is_empty() => (limit, offset.as_ref().map(|o| &o.value)),
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => (limit, Some(offset)),
+        _ => return Ok(None),
+    };
+    let mut count = |expr: &Expr| match Term::compile(expr, &columns, &mut binder) {
+        Some(Term::Constant(Number::Integer(n))) if n >= 0 => Some(n as usize), _ => None,
+    };
+    let Some(limit) = count(limit) else { return Ok(None) };
+    let offset = match offset { Some(expr) => match count(expr) { Some(n) => n, None => return Ok(None) }, None => 0 };
+    if binder.positional != parameters.len() && parameters.len() > binder.positional { return Ok(None); }
+    let keep = limit.saturating_add(offset);
+    let width = projection.len();
+    ensure!(keep.saturating_mul(width + 2).saturating_mul(std::mem::size_of::<Number>()) <= store.workspace_bytes, "ORDER BY workspace exceeded; increase workspace_mib or reduce LIMIT");
+    let (mut lower, mut upper) = (None, None);
+    for filter in &filters {
+        if let Condition::Compare(Term::Column(ci), op, Term::Constant(Number::Integer(time))) = filter && *ci == ts {
+            match op {
+                BinaryOperator::Gt => tighten_lower(&mut lower, *time, false), BinaryOperator::GtEq => tighten_lower(&mut lower, *time, true),
+                BinaryOperator::Lt => tighten_upper(&mut upper, *time, false), BinaryOperator::LtEq => tighten_upper(&mut upper, *time, true),
+                BinaryOperator::Eq => { tighten_lower(&mut lower, *time, true); tighten_upper(&mut upper, *time, true); }
+                _ => (),
+            }
+        }
+    }
+    let mut used = Vec::new();
+    key.columns(&mut used);
+    for term in &projection { term.columns(&mut used); }
+    for filter in &filters { match filter { Condition::Compare(a, _, b) => { a.columns(&mut used); b.columns(&mut used); }, Condition::Null(a, _) => a.columns(&mut used) } }
+    let rank_key = |a: (Number, i64), b: (Number, i64)| {
+        let order = a.0.order(b.0);
+        let order = if descending { order.reverse() } else { order };
+        order.then(if later_first { b.1.cmp(&a.1) } else { a.1.cmp(&b.1) })
+    };
+    let rank = |a: &(Number, i64, Vec<Number>), b: &(Number, i64, Vec<Number>)| rank_key((a.0, a.1), (b.0, b.1));
+    // The last kept candidate after the latest truncation. A row ranking
+    // after it cannot enter the result.
+    let mut worst: Option<(Number, i64)> = None;
+    let mut best: Vec<(Number, i64, Vec<Number>)> = Vec::new();
+    let mut supported = true;
+    if keep > 0 {
+        let mut row = vec![Number::Null; columns.len()];
+        store.visit_rows(&table, &used, (lower, upper), |time, values| {
+            for (&ci, value) in used.iter().zip(values) {
+                let Some(value) = Number::of(value) else { supported = false; return Ok(false) };
+                row[ci] = value;
+            }
+            if filters.iter().all(|f| f.holds(&row)) {
+                let value = key.evaluate(&row);
+                if worst.is_none_or(|w| rank_key((value, time), w).is_lt()) {
+                    best.push((value, time, projection.iter().map(|t| t.evaluate(&row)).collect()));
+                    if best.len() >= keep.saturating_mul(2).max(64) {
+                        best.sort_by(rank); best.truncate(keep);
+                        worst = best.last().map(|b| (b.0, b.1));
+                    }
+                }
+            }
+            Ok(true)
+        })?;
+    }
+    if !supported { return Ok(None); }
+    best.sort_by(rank);
+    Ok(Some(best.into_iter().skip(offset).take(limit).map(|(_, _, values)| values.into_iter().map(Number::cell).collect()).collect()))
+}
+
+/// Whether `query` can possibly answer this statement: it has an aggregate
+/// function, a GROUP BY, or an ORDER BY on a computed expression with LIMIT.
+/// Statements without any of them skip the native attempt entirely.
+pub(super) fn candidate(statement: &Statement) -> bool {
+    let Statement::Query(query) = statement else { return false };
+    let SetExpr::Select(select) = query.body.as_ref() else { return false };
+    if !matches!(&select.group_by, GroupByExpr::Expressions(e, _) if e.is_empty()) { return true; }
+    let function = |expr: &Expr| matches!(expr, Expr::Function(_));
+    if select.projection.iter().any(|item| matches!(item, SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } if contains(e, &function))) {
+        return true;
+    }
+    // An alias of a computed result column counts as a computed order.
+    let alias = |name: &str| select.projection.iter().any(|item| matches!(item, SelectItem::ExprWithAlias { alias, expr }
+        if alias.value.eq_ignore_ascii_case(name) && !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))));
+    let computed = query.order_by.as_ref().is_some_and(|order| matches!(&order.kind, OrderByKind::Expressions(orders)
+        if orders.first().is_some_and(|o| match &o.expr {
+            Expr::Identifier(name) => alias(&name.value),
+            Expr::CompoundIdentifier(_) | Expr::Value(_) => false,
+            _ => true,
+        })));
+    computed && query.limit_clause.is_some()
+}
+
+fn contains(expr: &Expr, test: &dyn Fn(&Expr) -> bool) -> bool {
+    test(expr) || match expr {
+        Expr::BinaryOp { left, right, .. } => contains(left, test) || contains(right, test),
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => contains(expr, test),
+        _ => false,
+    }
+}
+
+/// A number as SQLite computes with it.
+#[derive(Clone, Copy, Debug)]
+enum Number { Null, Integer(i64), Real(f64) }
+
+impl Number {
+    fn of(cell: &Cell) -> Option<Self> {
+        match cell { Cell::Null => Some(Self::Null), Cell::Integer(n) => Some(Self::Integer(*n)),
+            Cell::Real(bits) => Some(Self::Real(f64::from_bits(*bits))), _ => None }
+    }
+    fn cell(self) -> Cell {
+        match self { Self::Null => Cell::Null, Self::Integer(n) => Cell::Integer(n), Self::Real(n) => Cell::Real(n.to_bits()) }
+    }
+    fn real(self) -> Option<f64> {
+        match self { Self::Null => None, Self::Integer(n) => Some(n as f64), Self::Real(n) => Some(n) }
+    }
+    /// Order with NULL lowest; integers and reals compare exactly.
+    fn order(self, other: Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Null, Self::Null) => Ordering::Equal, (Self::Null, _) => Ordering::Less, (_, Self::Null) => Ordering::Greater,
+            (Self::Integer(a), Self::Integer(b)) => a.cmp(&b),
+            (Self::Real(a), Self::Real(b)) => a.total_cmp(&b),
+            (Self::Integer(a), Self::Real(b)) => integer_real(a, b),
+            (Self::Real(a), Self::Integer(b)) => integer_real(b, a).reverse(),
+        }
+    }
+}
+
+fn integer_real(a: i64, b: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if b < -9223372036854775808.0 { return Ordering::Greater; }
+    if b >= 9223372036854775808.0 { return Ordering::Less; }
+    let whole = b.floor();
+    a.cmp(&(whole as i64)).then(if b > whole { Ordering::Less } else { Ordering::Equal })
+}
+
+#[derive(Clone, Copy)]
+enum Operator { Add, Subtract, Multiply, Divide }
+
+/// Statement parameters for placeholders, consumed in text order. Without
+/// parameters, a placeholder makes the expression unsupported.
+struct Binder<'a> { parameters: Option<&'a [Cell]>, positional: usize }
+
+impl Binder<'_> {
+    fn value(&mut self, placeholder: &str) -> Option<Number> {
+        let parameters = self.parameters?;
+        let index = if placeholder == "?" { let i = self.positional; self.positional += 1; i }
+            else { placeholder.strip_prefix('?')?.parse::<usize>().ok()?.checked_sub(1)? };
+        Number::of(parameters.get(index)?)
+    }
+}
+
+/// Arithmetic on table columns and constants, evaluated with SQLite's rules.
+enum Term { Column(usize), Constant(Number), Negate(Box<Term>), Binary(Operator, Box<Term>, Box<Term>) }
+
+impl Term {
+    fn compile(expr: &Expr, columns: &[Column], binder: &mut Binder) -> Option<Self> {
+        Some(match expr {
+            Expr::Nested(expr) => Self::compile(expr, columns, binder)?,
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                let name = identifier(expr)?;
+                Self::Column(columns.iter().position(|c| c.name.eq_ignore_ascii_case(name))?)
+            }
+            Expr::Value(value) => match &value.value {
+                SqlValue::Number(n, _) => Self::Constant(match n.parse::<i64>() { Ok(n) => Number::Integer(n), Err(_) => Number::Real(n.parse().ok()?) }),
+                SqlValue::Null => Self::Constant(Number::Null),
+                SqlValue::Placeholder(p) => Self::Constant(binder.value(p)?),
+                _ => return None,
+            },
+            Expr::UnaryOp { op: UnaryOperator::Minus, expr } => Self::Negate(Box::new(Self::compile(expr, columns, binder)?)),
+            Expr::UnaryOp { op: UnaryOperator::Plus, expr } => Self::compile(expr, columns, binder)?,
+            Expr::BinaryOp { left, op, right } => {
+                let operator = match op { BinaryOperator::Plus => Operator::Add, BinaryOperator::Minus => Operator::Subtract,
+                    BinaryOperator::Multiply => Operator::Multiply, BinaryOperator::Divide => Operator::Divide, _ => return None };
+                let left = Self::compile(left, columns, binder)?;
+                let right = Self::compile(right, columns, binder)?;
+                Self::Binary(operator, Box::new(left), Box::new(right))
+            }
+            _ => return None,
+        })
+    }
+
+    fn columns(&self, used: &mut Vec<usize>) {
+        match self {
+            Self::Column(ci) => if !used.contains(ci) { used.push(*ci); },
+            Self::Constant(_) => (),
+            Self::Negate(term) => term.columns(used),
+            Self::Binary(_, left, right) => { left.columns(used); right.columns(used); }
+        }
+    }
+
+    fn evaluate(&self, row: &[Number]) -> Number {
+        match self {
+            Self::Column(ci) => row[*ci],
+            Self::Constant(value) => *value,
+            Self::Negate(term) => match term.evaluate(row) {
+                Number::Integer(n) => n.checked_neg().map_or(Number::Real(-(n as f64)), Number::Integer),
+                Number::Real(n) => Number::Real(-n), Number::Null => Number::Null,
+            },
+            Self::Binary(operator, left, right) => {
+                let (a, b) = (left.evaluate(row), right.evaluate(row));
+                if let (Number::Integer(a), Number::Integer(b)) = (a, b) {
+                    // Integer overflow continues in floating point.
+                    let exact = match operator {
+                        Operator::Add => a.checked_add(b), Operator::Subtract => a.checked_sub(b),
+                        Operator::Multiply => a.checked_mul(b),
+                        Operator::Divide => if b == 0 { return Number::Null } else { a.checked_div(b) },
+                    };
+                    if let Some(value) = exact { return Number::Integer(value); }
+                }
+                let (Some(a), Some(b)) = (a.real(), b.real()) else { return Number::Null };
+                match operator {
+                    Operator::Add => Number::Real(a + b), Operator::Subtract => Number::Real(a - b),
+                    Operator::Multiply => Number::Real(a * b),
+                    Operator::Divide => if b == 0.0 { Number::Null } else { Number::Real(a / b) },
+                }
+            }
+        }
+    }
+}
+
+/// A WHERE term: a comparison of two terms, or a NULL test.
+enum Condition { Compare(Term, BinaryOperator, Term), Null(Term, bool) }
+
+impl Condition {
+    fn holds(&self, row: &[Number]) -> bool {
+        match self {
+            Self::Null(term, null) => matches!(term.evaluate(row), Number::Null) == *null,
+            Self::Compare(left, op, right) => {
+                let (a, b) = (left.evaluate(row), right.evaluate(row));
+                if matches!(a, Number::Null) || matches!(b, Number::Null) { return false; }
+                let order = a.order(b);
+                match op {
+                    BinaryOperator::Eq => order.is_eq(), BinaryOperator::NotEq => order.is_ne(),
+                    BinaryOperator::Gt => order.is_gt(), BinaryOperator::GtEq => order.is_ge(),
+                    BinaryOperator::Lt => order.is_lt(), BinaryOperator::LtEq => order.is_le(), _ => false,
+                }
+            }
+        }
+    }
+}
+
+fn conditions(expr: &Expr, columns: &[Column], binder: &mut Binder, output: &mut Vec<Condition>) -> bool {
+    match expr {
+        Expr::Nested(expr) => conditions(expr, columns, binder, output),
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } =>
+            conditions(left, columns, binder, output) && conditions(right, columns, binder, output),
+        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::Eq | BinaryOperator::NotEq | BinaryOperator::Gt
+                | BinaryOperator::GtEq | BinaryOperator::Lt | BinaryOperator::LtEq) => {
+            let Some(left) = Term::compile(left, columns, binder) else { return false };
+            let Some(right) = Term::compile(right, columns, binder) else { return false };
+            output.push(Condition::Compare(left, op.clone(), right));
+            true
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            let Some(term) = Term::compile(inner, columns, binder) else { return false };
+            output.push(Condition::Null(term, matches!(expr, Expr::IsNull(_))));
+            true
+        }
+        _ => false,
+    }
 }
 
 fn grouped(store: &mut Store, statement: &Statement, parameters: &[Cell]) -> Result<Option<Vec<Vec<Cell>>>> {
@@ -89,7 +404,7 @@ fn grouped(store: &mut Store, statement: &Statement, parameters: &[Cell]) -> Res
     // SQLite resolves an ambiguous GROUP BY identifier to an input column
     // before a SELECT alias. A sensor named like the alias must keep that rule.
     if let Expr::Identifier(id) = &groups[0]
-        && store.columns(&table)?.iter().any(|c|c.name.eq_ignore_ascii_case(&id.value)) { return Ok(None); }
+        && store.column_defs(&table)?.iter().any(|c|c.name.eq_ignore_ascii_case(&id.value)) { return Ok(None); }
     let mut descending = false;
     if let Some(order) = &query.order_by {
         let OrderByKind::Expressions(orders) = &order.kind else { return Ok(None) };
