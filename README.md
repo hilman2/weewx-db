@@ -44,10 +44,14 @@ options in `weewx.conf`. A Raspberry Pi trial can run with 4 and 16 MiB, a NUC
 with 128 and 256 MiB. The budgets cap decoded columns and query workspace, not
 the whole process.
 
+**Classic skins render faster without changes.** Seasons, Belchertown,
+Neowx-Material and Weather Data Center regenerate their pages after each
+archive interval 7 to 31 percent faster than on SQLite. A complete first
+generation is 11 to 18 percent faster. Record queries such as the wettest or
+warmest day answer two to eight times faster than SQLite.
+
 The measurements behind these numbers, with raw reports and reproduction
-commands, are in [results/README.md](results/README.md). Small queries that
-SQLite already answers from its daily summaries, such as finding the wettest
-day, remain faster on SQLite.
+commands, are in [results/README.md](results/README.md).
 
 ## Put it into operation
 
@@ -110,9 +114,9 @@ binding as they are.
 ```ini
 [Databases]
     [[weewx_rust]]
+        database_type = SQLite
         driver = user.weewxdb.driver
         database_name = weewx.wwdb
-        SQLITE_ROOT = archive
         cache_mib = 32
         workspace_mib = 32
         sync_mode = background
@@ -122,10 +126,13 @@ binding as they are.
         database = weewx_rust
 ```
 
-`SQLITE_ROOT` is relative to the WeeWX root. On a package installation set it
-to `/var/lib/weewx`. Leave the memory budgets at their defaults for the first
-run; the [memory options](reference.md#memory-and-synchronization) describe
-what each one covers.
+`database_type = SQLite` places the file in the directory that
+`[DatabaseTypes]` names for SQLite, next to your SQLite archive on pip and
+package installations alike. Skins such as Belchertown also read it to choose
+their SQL syntax; the explicit `driver` still selects this database. Leave the
+memory budgets at their defaults for the first run; the
+[memory options](reference.md#memory-and-synchronization) describe what each
+one covers.
 
 With `sync_mode = background`, a commit is acknowledged after its journal
 entry is written and synchronized by a worker. After a power failure at most

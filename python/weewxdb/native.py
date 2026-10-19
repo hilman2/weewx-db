@@ -45,12 +45,36 @@ def register_units():
         weewx.units.agg_group[name] = 'group_count'
 
 
+_native_type = None
+# Dispatch decisions depend only on the registered providers. They are cached
+# per provider list; registering or removing a provider starts a new entry.
+_dispatch_cache = {}
+
+
 def is_native(provider):
-    from .xtypes import NativeXType
-    return type(provider) is NativeXType
+    global _native_type
+    if _native_type is None:
+        from .xtypes import NativeXType
+        _native_type = NativeXType
+    return type(provider) is _native_type
+
+
+def _cached(key, compute):
+    key = key + (tuple(weewx.xtypes.xtypes),)
+    try:
+        return _dispatch_cache[key]
+    except KeyError:
+        if len(_dispatch_cache) > 1024:
+            _dispatch_cache.clear()
+        value = _dispatch_cache[key] = compute()
+        return value
 
 
 def scalar_provider(observation):
+    return _cached(('scalar', observation), lambda: _scalar_provider(observation))
+
+
+def _scalar_provider(observation):
     for provider in weewx.xtypes.xtypes:
         if is_native(provider):
             continue
@@ -210,6 +234,10 @@ def native_xaggs(provider):
 
 
 def dispatch_allowed(method, target):
+    return _cached(('dispatch', method, target), lambda: _dispatch_allowed(method, target))
+
+
+def _dispatch_allowed(method, target):
     for provider in weewx.xtypes.xtypes:
         if is_native(provider):
             continue
@@ -342,6 +370,50 @@ def query_for(observation, span, aggregate, manager, options):
     return query
 
 
+_supported = {}
+
+
+def supported_aggregates():
+    key = (len(weewx.xtypes.ArchiveTable.valid_aggregate_types), len(weewx.xtypes.DailySummaries.agg_sql_dict))
+    if key not in _supported:
+        _supported.clear()
+        _supported[key] = set(weewx.xtypes.ArchiveTable.valid_aggregate_types) \
+            | set(weewx.xtypes.DailySummaries.agg_sql_dict) | HISTORICAL | EXTRA_AGGREGATES \
+            | {'avg_gt', 'avg_lt', 'not_null'}
+    return _supported[key]
+
+
+RESULT_LIMIT = 4096
+
+
+def result_cache(observation, span, aggregate_type, manager, options):
+    """Return the connection's result cache and the key for this aggregate.
+
+    A report evaluates many identical aggregates, for example the same
+    monthly maximum in several templates. Results are kept for one committed
+    database revision of the connection and never inside a transaction. The
+    key holds every option that changes the native query.
+    """
+    connection = manager.connection
+    native = getattr(connection, 'native', None)
+    if native is None:
+        return None, None
+    revision = native.revision()
+    if revision is None:
+        return None, None
+    state = getattr(connection, '_weewxdb_results', None)
+    if state is None or state[0] != revision or len(state[1]) > RESULT_LIMIT:
+        state = (revision, {})
+        connection._weewxdb_results = state
+    base = None
+    if observation in ['heatdeg', 'cooldeg', 'growdeg']:
+        base = repr(options.get('skin_dict', {}).get('Units', {}).get('DegreeDays', {}))
+    value = options.get('val')
+    key = (manager.table_name, observation, span[0], span[1], aggregate_type, options.get('source', 'auto'),
+           repr(value) if value is not None else None, options.get('fraction'), base, tuple(weewx.xtypes.xtypes))
+    return state[1], key
+
+
 def aggregate(observation, span, aggregate_type, manager, **options):
     aggregate_type = aggregate_type.lower()
     # Keep the existing two-column kernels, including their no-record-loading
@@ -349,16 +421,24 @@ def aggregate(observation, span, aggregate_type, manager, **options):
     if observation in ['dewpoint', 'inDewpoint', 'humidex', 'heatindex'] \
             and options.get('source', 'auto') == 'auto' and observation not in manager.sqlkeys and aggregate_type in ['sum', 'avg', 'min', 'max', 'count']:
         raise weewx.UnknownType(observation)
-    supported = set(weewx.xtypes.ArchiveTable.valid_aggregate_types) \
-        | set(weewx.xtypes.DailySummaries.agg_sql_dict) | HISTORICAL | EXTRA_AGGREGATES \
-        | {'avg_gt', 'avg_lt', 'not_null'}
-    if aggregate_type not in supported:
+    if aggregate_type not in supported_aggregates():
         raise weewx.UnknownAggregation(aggregate_type)
     provider = scalar_provider(observation) if observation not in manager.sqlkeys or options.get('source') in ['derived', 'fill_missing'] else None
-    with provider_lock(provider) if provider is not None else contextlib.nullcontext():
+    if provider is None:
+        # Weather providers can carry state between calls; only stateless
+        # queries are cached.
+        cache, key = result_cache(observation, span, aggregate_type, manager, options)
+        if cache is not None and key in cache:
+            return cache[key]
+        query = query_for(observation, span, aggregate_type, manager, options)
+        value = finish_aggregate(observation, aggregate_type, manager, query, request(manager, query))
+        if cache is not None:
+            cache[key] = value
+        return value
+    with provider_lock(provider):
         query = query_for(observation, span, aggregate_type, manager, options)
         result = request(manager, query)
-        if provider is not None and query['mode'] == 'weather':
+        if query['mode'] == 'weather':
             apply_state(provider, observation, result['state'], manager)
     return finish_aggregate(observation, aggregate_type, manager, query, result)
 

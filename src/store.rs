@@ -1,7 +1,7 @@
 //! Journaled mutations over immutable, indexed column blocks.
 
 use super::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -42,7 +42,14 @@ enum Mutation {
     Drop { table: String },
 }
 
-type Changes = BTreeMap<String, BTreeMap<i64, Option<Vec<Cell>>>>;
+/// Journal rows of one table. Cursors share the map; a write copies it only
+/// while a cursor still reads the previous version.
+pub(crate) type TableChanges = Arc<BTreeMap<i64, Option<Vec<Cell>>>>;
+type Changes = BTreeMap<String, TableChanges>;
+
+/// Identity, length and modification time of the main file and journal.
+/// Every commit, checkpoint and vacuum changes at least one of them.
+type Stamp = [Option<(u64, u64, std::time::SystemTime)>; 2];
 
 pub fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -60,6 +67,16 @@ pub(crate) fn read_head(path: &Path) -> Result<Option<Head>> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
+    }
+}
+
+fn file_stamp(path: &Path) -> Result<Option<(u64, u64, std::time::SystemTime)>> {
+    match std::fs::metadata(path) {
+        #[cfg(unix)]
+        Ok(meta) => Ok(Some((std::os::unix::fs::MetadataExt::ino(&meta), meta.len(), meta.modified()?))),
+        #[cfg(not(unix))]
+        Ok(meta) => Ok(Some((0, meta.len(), meta.modified()?))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None), Err(e) => Err(e.into()),
     }
 }
 
@@ -123,12 +140,15 @@ pub struct Store {
     pending: Vec<Mutation>,
     pending_bytes: usize,
     timeout: Duration,
-    stamp: Vec<Option<(u64, std::time::SystemTime)>>,
+    stamp: Stamp,
     pub workspace_bytes: usize,
     sync_mode: SyncMode,
     pending_sync: Option<(u64,std::thread::JoinHandle<std::io::Result<()>>)>,
     last_relaxed: bool,
     legacy_wal: bool,
+    /// Results of `aggregate` for the current snapshot and journal. Reports
+    /// repeat queries such as the first and last timestamp many times.
+    aggregates: HashMap<(usize, String, i64, i64, bool), Stats>,
 }
 
 impl Store {
@@ -169,8 +189,8 @@ impl Store {
         let lsn = snapshot.manifest.lsn;
         let mut store = Self { snapshot, path: path.to_owned(), changes: BTreeMap::new(),
             lsn, valid_wal_bytes: 0, writer: None, pending: vec![], pending_bytes: 0,
-            timeout: Duration::from_secs(5), stamp: vec![], workspace_bytes: 32*1024*1024,
-            sync_mode:SyncMode::Always,pending_sync:None,last_relaxed:false,legacy_wal:false };
+            timeout: Duration::from_secs(5), stamp: [None, None], workspace_bytes: 32*1024*1024,
+            sync_mode:SyncMode::Always,pending_sync:None,last_relaxed:false,legacy_wal:false, aggregates: HashMap::new() };
         store.replay()?;
         store.stamp = store.disk_stamp()?;
         drop(guard);
@@ -209,6 +229,13 @@ impl Store {
 
     pub fn refresh(&mut self) -> Result<()> {
         if self.in_transaction() { return Ok(()); }
+        // Every published transaction appends to the journal, and every
+        // checkpoint or vacuum replaces it. An unchanged journal therefore
+        // means unchanged data; an interrupted checkpoint can change only the
+        // main file, without changing what it contains. A writer still inside
+        // its transaction is not visible yet either way, so this check needs
+        // no lock. Writers compare both files in `begin`.
+        if self.journal_stamp()? == self.stamp[1] { return Ok(()); }
         let guard = lock(&self.path, false, self.timeout)?;
         if self.disk_stamp()? != self.stamp { self.reload()?; }
         drop(guard);
@@ -216,6 +243,7 @@ impl Store {
     }
 
     fn reload(&mut self) -> Result<()> {
+        self.aggregates.clear();
         self.snapshot = Database::open(&self.path, self.snapshot.cache_limit)?;
         self.lsn = self.snapshot.manifest.lsn;
         self.changes.clear();
@@ -226,11 +254,12 @@ impl Store {
         Ok(())
     }
 
-    fn disk_stamp(&self) -> Result<Vec<Option<(u64,std::time::SystemTime)>>> {
-        ["", ".head", ".wal"].iter().map(|suffix| match std::fs::metadata(sidecar(&self.path, suffix)) {
-            Ok(meta) => Ok(Some((meta.len(),meta.modified()?))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None), Err(e) => Err(e.into()),
-        }).collect()
+    fn disk_stamp(&self) -> Result<Stamp> {
+        Ok([file_stamp(&self.path)?, self.journal_stamp()?])
+    }
+
+    fn journal_stamp(&self) -> Result<Option<(u64, u64, std::time::SystemTime)>> {
+        file_stamp(&sidecar(&self.path, ".wal"))
     }
 
     fn replay(&mut self) -> Result<()> {
@@ -394,10 +423,11 @@ impl Store {
     }
 
     fn apply(&mut self, operation: &Mutation) -> Result<()> {
+        self.aggregates.clear();
         match operation {
             Mutation::Put { table, time, row } => {
                 self.table_index(table)?;
-                self.changes.entry(table.clone()).or_default().insert(*time, row.clone());
+                Arc::make_mut(self.changes.entry(table.clone()).or_default()).insert(*time, row.clone());
             }
             Mutation::Create { name, sql, columns } => {
                 ensure!(!self.tables().contains(name), "table already exists: {name}");
@@ -413,7 +443,7 @@ impl Store {
                 self.snapshot.manifest.tables[ti].columns.push(column.clone());
                 self.snapshot.manifest.tables[ti].sql = sql.clone();
                 if let Some(changes) = self.changes.get_mut(table) {
-                    for row in changes.values_mut().flatten() { row.push(column.default.clone().unwrap_or(Cell::Null)); }
+                    for row in Arc::make_mut(changes).values_mut().flatten() { row.push(column.default.clone().unwrap_or(Cell::Null)); }
                 }
             }
             Mutation::Drop { table } => {
@@ -436,7 +466,11 @@ impl Store {
     }
 
     pub fn columns(&self, table: &str) -> Result<Vec<Column>> {
-        Ok(self.snapshot.manifest.tables[self.table_index(table)?].columns.clone())
+        Ok(self.column_defs(table)?.to_vec())
+    }
+
+    pub(crate) fn column_defs(&self, table: &str) -> Result<&[Column]> {
+        Ok(&self.snapshot.manifest.tables[self.table_index(table)?].columns)
     }
 
     pub fn create_table(&mut self, name: &str, sql: &str, columns: Vec<Column>) -> Result<()> {
@@ -460,7 +494,7 @@ impl Store {
     }
 
     pub fn put(&mut self, table: &str, row: Vec<Cell>, replace: bool) -> Result<i64> {
-        let columns = self.columns(table)?;
+        let columns = self.column_defs(table)?;
         ensure!(row.len() == columns.len(), "wrong column count");
         let mut normalized = Vec::with_capacity(row.len());
         for (column, cell) in columns.iter().zip(row) {
@@ -470,6 +504,8 @@ impl Store {
         }
         let index = columns.iter().position(|c| c.name == "dateTime").unwrap();
         let Cell::Integer(time) = normalized[index] else { bail!("dateTime must be an integer") };
+        let table = self.snapshot.manifest.tables[self.table_index(table)?].name.clone();
+        let table = table.as_str();
         ensure!(replace || self.get(table, time)?.is_none(), "UNIQUE constraint failed: {table}.dateTime");
         self.stage(Mutation::Put { table: table.to_owned(), time, row: Some(normalized) })?;
         Ok(time)
@@ -494,7 +530,7 @@ impl Store {
         let bi = self.snapshot.manifest.tables[ti].blocks.partition_point(|b| b.last < time);
         if bi == self.snapshot.manifest.tables[ti].blocks.len() { return Ok(None); }
         let rows = self.snapshot.manifest.tables[ti].blocks[bi].rows;
-        let ts = self.columns(table)?.iter().position(|c| c.name == "dateTime").unwrap();
+        let ts = self.column_defs(table)?.iter().position(|c| c.name == "dateTime").unwrap();
         let times = self.snapshot.load(ti, bi, ts)?;
         let mut low = 0; let mut high = rows;
         while low < high {
@@ -502,7 +538,7 @@ impl Store {
             if timestamp(&times,rows,mid) < time { low = mid+1; } else { high = mid; }
         }
         if low < rows && timestamp(&times,rows,low) == time {
-            let kinds = self.columns(table)?.iter().map(|c|c.kind).collect::<Vec<_>>();
+            let kinds = self.column_defs(table)?.iter().map(|c|c.kind).collect::<Vec<_>>();
             let row = kinds.into_iter().enumerate().map(|(ci,kind)| {
                 Ok(decode(&self.snapshot.load(ti,bi,ci)?,rows,low,kind))
             }).collect::<Result<_>>()?;
@@ -519,12 +555,21 @@ impl Store {
     }
 
     pub fn aggregate(&mut self, table: &str, column: &str, span: Span) -> Result<Stats> {
-        let ci = self.columns(table)?.iter().position(|c| c.name == column).context("no such column")?;
-        let excluded = self.changes.get(table).map(|c| c.keys().copied().collect()).unwrap_or_default();
+        let key = (self.table_index(table)?, column.to_owned(), span.start, span.stop, span.daily);
+        if let Some(stats) = self.aggregates.get(&key) { return Ok(stats.clone()); }
+        let stats = self.aggregate_uncached(table, column, span)?;
+        if self.aggregates.len() >= 4096 { self.aggregates.clear(); }
+        self.aggregates.insert(key, stats.clone());
+        Ok(stats)
+    }
+
+    fn aggregate_uncached(&mut self, table: &str, column: &str, span: Span) -> Result<Stats> {
+        let ci = self.column_defs(table)?.iter().position(|c| c.name == column).context("no such column")?;
+        let changes = self.changes.get(table).cloned();
         let mut answer = Accumulator::default();
-        answer.merge(&self.snapshot.aggregate_excluding(table, column, span, &excluded)?);
+        answer.merge(&self.snapshot.aggregate_excluding(table, column, span, changes.as_deref())?);
         if let Some(changes) = self.changes.get(table) {
-            for (&time, row) in changes {
+            for (&time, row) in changes.iter() {
                 if !span.before(time) && !span.after(time) && let Some(row) = row { answer.add(row[ci].numeric()); }
             }
         }
@@ -552,13 +597,13 @@ impl Store {
     }
 
     fn scan_values(&mut self, table: &str, column: &str, span: Span, mut visit: impl FnMut(i64,Option<f64>)) -> Result<()> {
-        let ci = self.columns(table)?.iter().position(|c|c.name == column).context("unknown column")?;
+        let ci = self.column_defs(table)?.iter().position(|c|c.name == column).context("unknown column")?;
         let changes = self.changes.get(table);
         self.snapshot.scan(table,column,span,|time,value| {
             if changes.is_none_or(|c|!c.contains_key(&time)) { visit(time,value); }
         })?;
         if let Some(changes) = changes {
-            for (&time,row) in changes {
+            for (&time,row) in changes.iter() {
                 if !span.before(time) && !span.after(time) && let Some(row) = row { visit(time,row[ci].numeric()); }
             }
         }
@@ -627,8 +672,8 @@ impl Store {
         let mut info = self.snapshot.info();
         if let Some(changes) = self.changes.get(&info.archive).cloned() {
             let ti = self.table_index(&info.archive)?;
-            let ts = self.columns(&info.archive)?.iter().position(|c|c.name == "dateTime").unwrap();
-            for (&time,row) in &changes {
+            let ts = self.column_defs(&info.archive)?.iter().position(|c|c.name == "dateTime").unwrap();
+            for (&time,row) in changes.iter() {
                 let blocks = &self.snapshot.manifest.tables[ti].blocks;
                 let bi = blocks.partition_point(|b|b.last < time);
                 let exists = if bi < blocks.len() && time >= blocks[bi].first {
@@ -659,7 +704,7 @@ impl Store {
             }
         }
         Ok(StoreInfo { snapshot: info, lsn: self.lsn, journal_bytes: self.valid_wal_bytes,
-            changed_rows: self.changes.values().map(BTreeMap::len).sum(),
+            changed_rows: self.changes.values().map(|c| c.len()).sum(),
             indexed_columns: self.snapshot.manifest.tables.iter().map(|t| t.columns.len()).sum(),
             summarized_blocks: self.snapshot.manifest.tables.iter().flat_map(|t| &t.blocks)
                 .flat_map(|b| &b.columns).filter(|c| c.stats.is_some()).count() })
@@ -733,6 +778,7 @@ impl Store {
         self.lsn = manifest.lsn;
         self.snapshot = Database::open(&self.path, self.snapshot.cache_limit)?;
         self.changes.clear();
+        self.aggregates.clear();
         self.reset_wal()?;
         self.stamp = self.disk_stamp()?;
         Ok(())
@@ -780,6 +826,7 @@ impl Store {
         // between replacing the data file and removing that pointer.
         std::fs::remove_file(sidecar(&self.path,".head"))?;
         self.snapshot = Database::open(&self.path,self.snapshot.cache_limit)?;
+        self.aggregates.clear();
         self.lsn = manifest.lsn;
         self.reset_wal()?;
         self.stamp = self.disk_stamp()?;
@@ -856,23 +903,35 @@ fn append_rows(output: &mut File, columns: &[Column], rows: impl Iterator<Item=V
     Ok(())
 }
 
+/// Delivery order of a cursor. `Times` delivers a precomputed list, used for
+/// ORDER BY on a measurement column.
+enum Order { Forward, Reverse { entered: bool }, Times(Vec<i64>, usize) }
+
 /// A cursor keeps at most one block's projected columns and the small journal
-/// overlay. It never materializes the historical archive to execute SQL.
+/// overlay. It never materializes the historical archive to execute SQL,
+/// except for the bounded time list of an ORDER BY ... LIMIT.
 pub(crate) struct RowCursor {
     pub time: i64,
     ti: usize,
     ts: usize,
     lower: Option<(i64, bool)>,
     upper: Option<(i64, bool)>,
+    /// Forward: next block. Reverse: blocks before this index remain.
     bi: usize,
+    /// Forward: next row. Reverse: rows before this index remain.
     ri: usize,
     loaded_bi: usize,
-    columns: HashMap<usize, Arc<[u8]>>,
-    overlay: Vec<(i64, Option<Vec<Cell>>)>,
-    oi: usize,
-    suppressed: BTreeSet<i64>,
+    columns: Vec<Option<Arc<[u8]>>>,
+    overlay: Option<TableChanges>,
+    /// Journal rows up to this time, in delivery order, are done.
+    overlay_done: Option<i64>,
     current: Option<(usize, usize)>,
-    overlay_row: Option<Vec<Cell>>,
+    overlay_row: Option<i64>,
+    order: Order,
+    /// Column kinds and the row count of the current block, so that loaded
+    /// columns can be decoded without the store.
+    kinds: Vec<Kind>,
+    rows: usize,
     pub pruning: Vec<(usize, String, Option<f64>)>,
 }
 
@@ -885,27 +944,58 @@ impl RowCursor {
         let ti = store.table_index(table)?;
         let ts = store.snapshot.manifest.tables[ti].columns.iter().position(|c| c.name == "dateTime").unwrap();
         let bi = store.snapshot.manifest.tables[ti].blocks.partition_point(|b| before(lower, b.last));
-        let overlay = store.changes.get(table).map(|c| c.iter().map(|(&t,r)| (t,r.clone())).collect::<Vec<_>>()).unwrap_or_default();
-        let suppressed = overlay.iter().map(|(t,_)| *t).collect();
-        Ok(Self { time: 0, ti, ts, lower, upper, bi, ri: 0, loaded_bi: usize::MAX, columns: HashMap::new(),
-            overlay, oi: 0, suppressed, current: None, overlay_row: None, pruning: vec![] })
+        let name = &store.snapshot.manifest.tables[ti].name;
+        let overlay = store.changes.get(name).filter(|c| !c.is_empty()).cloned();
+        let kinds: Vec<Kind> = store.snapshot.manifest.tables[ti].columns.iter().map(|c| c.kind).collect();
+        Ok(Self { time: 0, ti, ts, lower, upper, bi, ri: 0, loaded_bi: usize::MAX, columns: vec![None; kinds.len()],
+            overlay, overlay_done: None, current: None, overlay_row: None, order: Order::Forward, kinds, rows: 0, pruning: vec![] })
+    }
+
+    /// Deliver rows by descending dateTime.
+    pub fn new_reverse(store: &Store, table: &str, lower: Option<(i64,bool)>, upper: Option<(i64,bool)>) -> Result<Self> {
+        let mut cursor = Self::new_bounds(store, table, lower, upper)?;
+        cursor.bi = store.snapshot.manifest.tables[cursor.ti].blocks.partition_point(|b| !after(upper, b.first));
+        cursor.order = Order::Reverse { entered: false };
+        Ok(cursor)
+    }
+
+    /// Deliver exactly these rows in this order. Every time must exist.
+    pub fn new_times(store: &Store, table: &str, times: Vec<i64>) -> Result<Self> {
+        let mut cursor = Self::new_bounds(store, table, None, None)?;
+        cursor.order = Order::Times(times, 0);
+        Ok(cursor)
+    }
+
+    fn pruned(&self, store: &Store, bi: usize) -> bool {
+        self.pruning.iter().any(|(ci,op,value)| {
+            let Some(stats) = store.snapshot.block_summary(self.ti,bi,*ci) else { return false };
+            let rows = store.snapshot.manifest.tables[self.ti].blocks[bi].rows as u64;
+            match (op.as_str(), value) {
+                ("null",_) => stats.count == rows, ("notnull",_) => stats.count == 0,
+                (_,_) if stats.count == 0 => true,
+                ("eq",Some(v)) => stats.min.is_some_and(|min| min > *v) || stats.max.is_some_and(|max| max < *v),
+                ("gt",Some(v)) => stats.max.is_some_and(|max| max <= *v),
+                ("ge",Some(v)) => stats.max.is_some_and(|max| max < *v),
+                ("lt",Some(v)) => stats.min.is_some_and(|min| min >= *v),
+                ("le",Some(v)) => stats.min.is_some_and(|min| min > *v), _ => false,
+            }
+        })
+    }
+
+    fn enter(&mut self, store: &mut Store, bi: usize) -> Result<Arc<[u8]>> {
+        if self.loaded_bi != bi {
+            self.columns.iter_mut().for_each(|c| *c = None); self.loaded_bi = bi;
+            self.rows = store.snapshot.manifest.tables[self.ti].blocks[bi].rows;
+        }
+        if self.columns[self.ts].is_none() {
+            self.columns[self.ts] = Some(store.snapshot.load(self.ti, bi, self.ts)?);
+        }
+        Ok(self.columns[self.ts].clone().unwrap())
     }
 
     fn base_next(&mut self, store: &mut Store) -> Result<Option<(i64, usize, usize)>> {
         while self.bi < store.snapshot.manifest.tables[self.ti].blocks.len() {
-            if self.loaded_bi != self.bi && self.pruning.iter().any(|(ci,op,value)| {
-                let Some(stats) = store.snapshot.block_summary(self.ti,self.bi,*ci) else { return false };
-                let rows = store.snapshot.manifest.tables[self.ti].blocks[self.bi].rows as u64;
-                match (op.as_str(), value) {
-                    ("null",_) => stats.count == rows, ("notnull",_) => stats.count == 0,
-                    (_,_) if stats.count == 0 => true,
-                    ("eq",Some(v)) => stats.min.is_some_and(|min| min > *v) || stats.max.is_some_and(|max| max < *v),
-                    ("gt",Some(v)) => stats.max.is_some_and(|max| max <= *v),
-                    ("ge",Some(v)) => stats.max.is_some_and(|max| max < *v),
-                    ("lt",Some(v)) => stats.min.is_some_and(|min| min >= *v),
-                    ("le",Some(v)) => stats.min.is_some_and(|min| min > *v), _ => false,
-                }
-            }) {
+            if self.loaded_bi != self.bi && self.pruned(store, self.bi) {
                 store.snapshot.metrics.skipped_blocks += 1;
                 self.bi += 1; self.ri = 0; continue;
             }
@@ -913,11 +1003,7 @@ impl RowCursor {
             if after(self.upper, block.first) { return Ok(None); }
             let n = block.rows;
             let entering = self.loaded_bi != self.bi;
-            if entering { self.columns.clear(); self.loaded_bi = self.bi; }
-            if !self.columns.contains_key(&self.ts) {
-                self.columns.insert(self.ts, store.snapshot.load(self.ti, self.bi, self.ts)?);
-            }
-            let times = self.columns[&self.ts].clone();
+            let times = self.enter(store, self.bi)?;
             if entering {
                 let mut first = 0; let mut stop = n;
                 while first < stop {
@@ -929,7 +1015,7 @@ impl RowCursor {
             while self.ri < n {
                 let time = timestamp(&times, n, self.ri);
                 if after(self.upper, time) { return Ok(None); }
-                if !before(self.lower, time) && !self.suppressed.contains(&time) { return Ok(Some((time, self.bi, self.ri))); }
+                if !before(self.lower, time) && !self.overlay.as_ref().is_some_and(|o| o.contains_key(&time)) { return Ok(Some((time, self.bi, self.ri))); }
                 self.ri += 1;
             }
             self.bi += 1; self.ri = 0;
@@ -937,32 +1023,325 @@ impl RowCursor {
         Ok(None)
     }
 
-    pub fn advance(&mut self, store: &mut Store) -> Result<bool> {
-        let base = self.base_next(store)?;
-        while self.oi < self.overlay.len() {
-            let (time, row) = &self.overlay[self.oi];
-            if before(self.lower, *time) || row.is_none() { self.oi += 1; continue; }
-            if after(self.upper, *time) { break; }
-            if base.is_none_or(|(t,_,_)| *time < t) {
-                self.time = *time; self.overlay_row = row.clone(); self.current = None; self.oi += 1;
-                return Ok(true);
+    fn base_previous(&mut self, store: &mut Store) -> Result<Option<(i64, usize, usize)>> {
+        while self.bi > 0 {
+            let bi = self.bi - 1;
+            let entered = matches!(self.order, Order::Reverse { entered: true });
+            if !entered && self.pruned(store, bi) {
+                store.snapshot.metrics.skipped_blocks += 1;
+                self.bi -= 1; continue;
             }
-            break;
+            let block = &store.snapshot.manifest.tables[self.ti].blocks[bi];
+            if before(self.lower, block.last) { return Ok(None); }
+            let n = block.rows;
+            let times = self.enter(store, bi)?;
+            if !entered {
+                let mut first = 0; let mut stop = n;
+                while first < stop {
+                    let middle = first + (stop-first)/2;
+                    if !after(self.upper,timestamp(&times,n,middle)) { first = middle+1; } else { stop = middle; }
+                }
+                self.ri = first;
+                self.order = Order::Reverse { entered: true };
+            }
+            while self.ri > 0 {
+                let time = timestamp(&times, n, self.ri - 1);
+                if before(self.lower, time) { return Ok(None); }
+                if !self.overlay.as_ref().is_some_and(|o| o.contains_key(&time)) { return Ok(Some((time, bi, self.ri - 1))); }
+                self.ri -= 1;
+            }
+            self.bi -= 1;
+            self.order = Order::Reverse { entered: false };
         }
-        if let Some((time, bi, ri)) = base {
-            self.time = time; self.current = Some((bi, ri)); self.overlay_row = None; self.ri += 1;
-            if self.loaded_bi != bi { self.columns.clear(); self.loaded_bi = bi; }
+        Ok(None)
+    }
+
+    fn deliver_base(&mut self, time: i64, bi: usize, ri: usize) {
+        // The block was entered while finding this row, so its columns and
+        // row count are current.
+        debug_assert_eq!(self.loaded_bi, bi);
+        self.time = time; self.current = Some((bi, ri)); self.overlay_row = None;
+    }
+
+    /// The current cell if it can be read without the store: a journal row or
+    /// an already loaded column.
+    pub fn loaded_cell(&self, ci: usize) -> Option<Cell> {
+        if let Some(time) = self.overlay_row {
+            return self.overlay.as_ref()?.get(&time)?.as_ref().map(|row| row[ci].clone());
+        }
+        let (_, ri) = self.current?;
+        Some(decode(self.columns.get(ci)?.as_ref()?, self.rows, ri, self.kinds[ci]))
+    }
+
+    fn deliver_overlay(&mut self, time: i64) {
+        self.time = time; self.overlay_row = Some(time); self.current = None;
+    }
+
+    pub fn advance(&mut self, store: &mut Store) -> Result<bool> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        match self.order {
+            Order::Times(..) => self.advance_times(store),
+            Order::Reverse { .. } => {
+                let base = self.base_previous(store)?;
+                if let Some(overlay) = &self.overlay {
+                    let end = match self.overlay_done {
+                        Some(done) => Excluded(done),
+                        None => match self.upper { Some((t, true)) => Included(t), Some((t, false)) => Excluded(t), None => Unbounded },
+                    };
+                    let mut found = None;
+                    for (&time, row) in overlay.range((Unbounded, end)).rev() {
+                        if before(self.lower, time) || base.is_some_and(|(t,_,_)| time <= t) { break; }
+                        self.overlay_done = Some(time);
+                        if row.is_some() { found = Some(time); break; }
+                    }
+                    if let Some(time) = found { self.deliver_overlay(time); return Ok(true); }
+                }
+                if let Some((time, bi, ri)) = base {
+                    self.deliver_base(time, bi, ri);
+                    self.ri = ri;
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+            Order::Forward => {
+                let base = self.base_next(store)?;
+                if let Some(overlay) = &self.overlay {
+                    let start = match self.overlay_done {
+                        Some(done) => Excluded(done),
+                        None => match self.lower { Some((t, true)) => Included(t), Some((t, false)) => Excluded(t), None => Unbounded },
+                    };
+                    let mut found = None;
+                    for (&time, row) in overlay.range((start, Unbounded)) {
+                        if after(self.upper, time) || base.is_some_and(|(t,_,_)| time >= t) { break; }
+                        self.overlay_done = Some(time);
+                        if row.is_some() { found = Some(time); break; }
+                    }
+                    if let Some(time) = found { self.deliver_overlay(time); return Ok(true); }
+                }
+                if let Some((time, bi, ri)) = base {
+                    self.deliver_base(time, bi, ri);
+                    self.ri += 1;
+                    return Ok(true);
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    fn advance_times(&mut self, store: &mut Store) -> Result<bool> {
+        let Order::Times(times, index) = &mut self.order else { unreachable!() };
+        let Some(&time) = times.get(*index) else { return Ok(false) };
+        *index += 1;
+        if self.overlay.as_ref().is_some_and(|o| o.contains_key(&time)) {
+            self.deliver_overlay(time);
             return Ok(true);
         }
-        Ok(false)
+        let bi = store.snapshot.manifest.tables[self.ti].blocks.partition_point(|b| b.last < time);
+        ensure!(bi < store.snapshot.manifest.tables[self.ti].blocks.len(), "ordered row missing");
+        let n = store.snapshot.manifest.tables[self.ti].blocks[bi].rows;
+        let times = self.enter(store, bi)?;
+        let (mut first, mut stop) = (0, n);
+        while first < stop {
+            let middle = first + (stop-first)/2;
+            if timestamp(&times,n,middle) < time { first = middle+1; } else { stop = middle; }
+        }
+        ensure!(first < n && timestamp(&times,n,first) == time, "ordered row missing");
+        self.deliver_base(time, bi, first);
+        Ok(true)
     }
 
     pub fn cell(&mut self, store: &mut Store, ci: usize) -> Result<Cell> {
-        if let Some(row) = &self.overlay_row { return Ok(row[ci].clone()); }
+        if let Some(time) = self.overlay_row {
+            let row = self.overlay.as_ref().and_then(|o| o.get(&time)).and_then(Option::as_ref).context("journal row missing")?;
+            return Ok(row[ci].clone());
+        }
         let (bi, ri) = self.current.context("cursor is exhausted")?;
-        if !self.columns.contains_key(&ci) { self.columns.insert(ci, store.snapshot.load(self.ti, bi, ci)?); }
-        Ok(decode(&self.columns[&ci], store.snapshot.manifest.tables[self.ti].blocks[bi].rows, ri,
-            store.snapshot.manifest.tables[self.ti].columns[ci].kind))
+        if self.columns[ci].is_none() { self.columns[ci] = Some(store.snapshot.load(self.ti, bi, ci)?); }
+        Ok(decode(self.columns[ci].as_ref().unwrap(), self.rows, ri, self.kinds[ci]))
+    }
+}
+
+/// A WHERE term the virtual table evaluates itself for ORDER BY ... LIMIT.
+pub(crate) struct Filter { pub column: usize, pub op: String, pub value: Value }
+
+impl Filter {
+    /// SQLite's result for this row, or None if this engine cannot decide it
+    /// exactly, for example for a text operand.
+    fn test(&self, cell: &Cell) -> Option<bool> {
+        match self.op.as_str() {
+            "null" => return Some(*cell == Cell::Null),
+            "notnull" => return Some(*cell != Cell::Null),
+            // IS and IS NOT compare NULL like a value.
+            "is" | "isnot" => {
+                let same = match (*cell == Cell::Null, self.value == Value::Null) {
+                    (true, true) => true, (false, false) => compare_numeric(cell, &self.value)?.is_eq(), _ => false,
+                };
+                return Some(same == (self.op == "is"));
+            }
+            _ => (),
+        }
+        if *cell == Cell::Null || self.value == Value::Null { return Some(false); }
+        let order = compare_numeric(cell, &self.value)?;
+        Some(match self.op.as_str() {
+            "eq" => order.is_eq(), "ne" => order.is_ne(), "gt" => order.is_gt(), "ge" => order.is_ge(),
+            "lt" => order.is_lt(), "le" => order.is_le(), _ => return None,
+        })
+    }
+}
+
+/// Exact comparison of a stored number with a numeric SQL value.
+fn compare_numeric(cell: &Cell, value: &Value) -> Option<std::cmp::Ordering> {
+    match (cell, value) {
+        (Cell::Integer(a), Value::Integer(b)) => Some(a.cmp(b)),
+        (Cell::Real(a), Value::Real(b)) => f64::from_bits(*a).partial_cmp(b),
+        (Cell::Real(a), Value::Integer(b)) => compare_int_real(*b, f64::from_bits(*a)).map(std::cmp::Ordering::reverse),
+        (Cell::Integer(a), Value::Real(b)) => compare_int_real(*a, *b),
+        _ => None,
+    }
+}
+
+fn compare_int_real(a: i64, b: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if b.is_nan() { return None; }
+    if b < -9223372036854775808.0 { return Some(Ordering::Greater); }
+    if b >= 9223372036854775808.0 { return Some(Ordering::Less); }
+    let whole = b.floor() as i64;
+    Some(a.cmp(&whole).then(if b > whole as f64 { Ordering::Less } else { Ordering::Equal }))
+}
+
+/// A time bound and whether it is inclusive; None is unbounded.
+pub(crate) type Bound = Option<(i64, bool)>;
+
+/// Sort key in SQLite order: NULL first, then numbers.
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+enum Key { Null, Number(f64), Integer(i64) }
+
+impl Key {
+    fn of(cell: &Cell) -> Self {
+        match cell { Cell::Integer(n) => Key::Integer(*n), Cell::Real(n) => Key::Number(f64::from_bits(*n)), _ => Key::Null }
+    }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Key::Null, Key::Null) => Ordering::Equal, (Key::Null, _) => Ordering::Less, (_, Key::Null) => Ordering::Greater,
+            (Key::Integer(a), Key::Integer(b)) => a.cmp(b),
+            (Key::Number(a), Key::Number(b)) => a.total_cmp(b),
+            (Key::Integer(a), Key::Number(b)) => compare_int_real(*a, *b).unwrap_or(Ordering::Equal),
+            (Key::Number(a), Key::Integer(b)) => compare_int_real(*b, *a).unwrap_or(Ordering::Equal).reverse(),
+        }
+    }
+    fn approximate(&self) -> Option<f64> {
+        match self { Key::Null => None, Key::Number(n) => Some(*n), Key::Integer(n) => Some(*n as f64) }
+    }
+}
+
+impl Store {
+    /// Call `visit(time, values)` for every row within the bounds, with the
+    /// values of `columns` in that order. Base rows come block by block in
+    /// time order, then the journal rows; replaced base rows are skipped.
+    pub(crate) fn visit_rows(&mut self, table: &str, columns: &[usize], (lower, upper): (Bound, Bound),
+            mut visit: impl FnMut(i64, &[Cell]) -> Result<bool>) -> Result<()> {
+        let ti = self.table_index(table)?;
+        let ts = self.snapshot.manifest.tables[ti].columns.iter().position(|c| c.name == "dateTime").unwrap();
+        let kinds: Vec<Kind> = columns.iter().map(|&ci| self.snapshot.manifest.tables[ti].columns[ci].kind).collect();
+        let overlay = self.changes.get(&self.snapshot.manifest.tables[ti].name).filter(|o| !o.is_empty()).cloned();
+        let mut values = vec![Cell::Null; columns.len()];
+        let first = self.snapshot.manifest.tables[ti].blocks.partition_point(|b| before(lower, b.last));
+        for bi in first..self.snapshot.manifest.tables[ti].blocks.len() {
+            let block = &self.snapshot.manifest.tables[ti].blocks[bi];
+            if after(upper, block.first) { break; }
+            let n = block.rows;
+            let times = self.snapshot.load(ti, bi, ts)?;
+            let data = columns.iter().map(|&ci| self.snapshot.load(ti, bi, ci)).collect::<Result<Vec<_>>>()?;
+            for ri in 0..n {
+                let time = timestamp(&times, n, ri);
+                if before(lower, time) { continue; }
+                if after(upper, time) { break; }
+                if overlay.as_ref().is_some_and(|o| o.contains_key(&time)) { continue; }
+                for ((value, bytes), kind) in values.iter_mut().zip(&data).zip(&kinds) { *value = decode(bytes, n, ri, *kind); }
+                if !visit(time, &values)? { return Ok(()); }
+            }
+        }
+        if let Some(overlay) = &overlay {
+            for (&time, row) in overlay.iter() {
+                let Some(row) = row else { continue };
+                if before(lower, time) || after(upper, time) { continue; }
+                for (value, &ci) in values.iter_mut().zip(columns) { *value = row[ci].clone(); }
+                if !visit(time, &values)? { return Ok(()); }
+            }
+        }
+        Ok(())
+    }
+
+    /// Times of the rows within the bounds that pass every filter, ordered by
+    /// `column` (ascending or descending, NULL lowest) and then by ascending
+    /// time, truncated to `limit`. None means a filter cannot be evaluated
+    /// exactly; the caller must then let SQLite sort.
+    pub(crate) fn ordered_times(&mut self, table: &str, column: usize, descending: bool,
+            (lower, upper): (Bound, Bound), filters: &[Filter], limit: usize) -> Result<Option<Vec<i64>>> {
+        use std::cmp::Ordering;
+        let ti = self.table_index(table)?;
+        let ts = self.snapshot.manifest.tables[ti].columns.iter().position(|c| c.name == "dateTime").unwrap();
+        let kinds: Vec<Kind> = self.snapshot.manifest.tables[ti].columns.iter().map(|c| c.kind).collect();
+        let overlay = self.changes.get(&self.snapshot.manifest.tables[ti].name).cloned();
+        let rank = |a: &(Key, i64), b: &(Key, i64)| -> Ordering {
+            let order = a.0.cmp(&b.0);
+            (if descending { order.reverse() } else { order }).then(a.1.cmp(&b.1))
+        };
+        let mut best: Vec<(Key, i64)> = Vec::new();
+        if limit == 0 { return Ok(Some(vec![])); }
+        let shrink = |best: &mut Vec<(Key, i64)>| { best.sort_by(rank); best.truncate(limit); };
+        let cutoff = |best: &Vec<(Key, i64)>| -> Option<Key> { (best.len() >= limit).then(|| best[limit - 1].0) };
+        let blocks = self.snapshot.manifest.tables[ti].blocks.len();
+        let first = self.snapshot.manifest.tables[ti].blocks.partition_point(|b| before(lower, b.last));
+        for bi in first..blocks {
+            let block = &self.snapshot.manifest.tables[ti].blocks[bi];
+            if after(upper, block.first) { break; }
+            let n = block.rows;
+            // A full candidate list makes a block irrelevant when no value in
+            // it can rank above the current last candidate.
+            if let Some(worst) = cutoff(&best) && let Some(stats) = self.snapshot.block_summary(ti, bi, column) {
+                let complete = stats.count == n as u64;
+                let skip = match (descending, worst.approximate()) {
+                    // NULL ranks lowest. Later blocks also lose every tie on time.
+                    (_, _) if stats.count == 0 => descending || worst == Key::Null,
+                    (true, Some(w)) => stats.max.is_some_and(|max| max + max.abs() * 1e-12 < w),
+                    (false, Some(w)) => complete && stats.min.is_some_and(|min| min - min.abs() * 1e-12 > w),
+                    (true, None) => false, (false, None) => true,
+                };
+                if skip { continue; }
+            }
+            let times = self.snapshot.load(ti, bi, ts)?;
+            let values = self.snapshot.load(ti, bi, column)?;
+            let mut tested = Vec::with_capacity(filters.len());
+            for filter in filters { tested.push(self.snapshot.load(ti, bi, filter.column)?); }
+            for ri in 0..n {
+                let time = timestamp(&times, n, ri);
+                if before(lower, time) { continue; }
+                if after(upper, time) { break; }
+                if overlay.as_ref().is_some_and(|o| o.contains_key(&time)) { continue; }
+                let mut pass = true;
+                for (filter, bytes) in filters.iter().zip(&tested) {
+                    match filter.test(&decode(bytes, n, ri, kinds[filter.column])) { Some(true) => (), Some(false) => { pass = false; break; }, None => return Ok(None) }
+                }
+                if !pass { continue; }
+                best.push((Key::of(&decode(&values, n, ri, kinds[column])), time));
+                if best.len() >= limit.saturating_mul(2).max(64) { shrink(&mut best); }
+            }
+        }
+        if let Some(overlay) = &overlay {
+            for (&time, row) in overlay.iter() {
+                let Some(row) = row else { continue };
+                if before(lower, time) || after(upper, time) { continue; }
+                let mut pass = true;
+                for filter in filters {
+                    match filter.test(&row[filter.column]) { Some(true) => (), Some(false) => { pass = false; break; }, None => return Ok(None) }
+                }
+                if pass { best.push((Key::of(&row[column]), time)); }
+            }
+        }
+        shrink(&mut best);
+        Ok(Some(best.into_iter().map(|(_, time)| time).collect()))
     }
 }
 

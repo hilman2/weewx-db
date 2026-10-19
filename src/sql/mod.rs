@@ -57,12 +57,27 @@ unsafe impl<'vtab> VTab<'vtab> for ArchiveTable {
         Ok((Cow::Owned(CString::new(definition).map_err(error)?), Self { base: Default::default(), store, table, time_index, connection }))
     }
 
+    /// The index string lists the constraints in argument order as
+    /// `column:operator`, then `|` and the delivery order: empty for
+    /// unordered, `asc` or `desc` by dateTime, or `top:column:descending`.
     fn best_index(&self, info: &mut vtab::IndexInfo) -> rusqlite::Result<bool> {
         let mut plan = Vec::new();
         let mut argument = 0;
+        // SQLite offers LIMIT only when every WHERE term is a constraint on
+        // this table, and keeps a plan with LIMIT only when every constraint
+        // has an argument. Top-k evaluates each of them itself.
+        let mut evaluable = true;
+        let mut limited = false;
         for (constraint, mut usage) in info.constraints_and_usages() {
-            if !constraint.is_usable() { continue; }
+            if !constraint.is_usable() { evaluable = false; continue; }
             let op = match constraint.operator() {
+                vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_LIMIT | vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_OFFSET => {
+                    let limit = constraint.operator() == vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_LIMIT;
+                    limited |= limit;
+                    argument += 1; usage.set_argv_index(argument);
+                    plan.push((-2, if limit { "limit" } else { "offset" }.to_owned()));
+                    continue;
+                }
                 vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_EQ => "eq",
                 vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_GT => "gt",
                 vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_GE => "ge",
@@ -70,21 +85,33 @@ unsafe impl<'vtab> VTab<'vtab> for ArchiveTable {
                 vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_LE => "le",
                 vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_ISNULL => "null",
                 vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_ISNOTNULL => "notnull",
-                _ => continue,
+                vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_NE => "ne",
+                vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_IS => "is",
+                vtab::IndexConstraintOp::SQLITE_INDEX_CONSTRAINT_ISNOT => "isnot",
+                _ => { evaluable = false; continue },
             };
             if constraint.column() >= -1 {
-                if op != "null" && op != "notnull" { argument += 1; usage.set_argv_index(argument); }
+                // NULL tests receive an argument too; their value is unused.
+                argument += 1; usage.set_argv_index(argument);
                 // SQLite rechecks affinity, non-integer arguments and NULLs.
                 plan.push((constraint.column(),op.to_owned()));
             }
         }
-        info.set_idx_str(&serde_json::to_string(&plan).map_err(error)?);
-        let point = plan.iter().any(|(ci,p)| (*ci == self.time_index as i32 || *ci == -1) && p == "eq");
+        let time = |column: c_int| column == self.time_index as i32 || column == -1;
+        let orders: Vec<(c_int, bool)> = info.order_bys().map(|o| (o.column(), o.is_order_by_desc())).collect();
+        let order = match orders.as_slice() {
+            [(column, false)] if time(*column) => "asc".to_owned(),
+            [(column, true)] if time(*column) => "desc".to_owned(),
+            [(column, descending)] | [(column, descending), (_, false)]
+                if limited && evaluable && *column >= 0 && !time(*column) && orders.get(1).is_none_or(|o| time(o.0)) =>
+                format!("top:{column}:{}", u8::from(*descending)),
+            _ => String::new(),
+        };
+        if !order.is_empty() { info.set_order_by_consumed(true); }
+        let point = plan.iter().any(|(ci,p)| time(*ci) && p == "eq");
+        info.set_idx_str(&format!("{}|{order}", plan.iter().map(|(ci,op)| format!("{ci}:{op}")).collect::<Vec<_>>().join(",")));
         info.set_estimated_cost(if point { 1.0 } else if !plan.is_empty() { 100.0 } else { 1_000_000.0 });
         info.set_estimated_rows(if point { 1 } else { 10000 });
-        if info.num_of_order_by() == 1 && info.order_bys().all(|o| o.column() == self.time_index as i32 && !o.is_order_by_desc()) {
-            info.set_order_by_consumed(true);
-        }
         Ok(true)
     }
 
@@ -109,7 +136,7 @@ impl<'vtab> UpdateVTab<'vtab> for ArchiveTable {
         let old: i64 = args.get(0)?;
         let values = args.iter().skip(2).map(Cell::read).collect::<Result<Vec<_>>>().map_err(error)?;
         let mut store = guard(&self.store)?;
-        let time_index = store.columns(&self.table).map_err(error)?.iter().position(|c| c.name == "dateTime").unwrap();
+        let time_index = store.column_defs(&self.table).map_err(error)?.iter().position(|c| c.name == "dateTime").unwrap();
         let new_time = match values[time_index] { Cell::Integer(n) => n, _ => return Err(error("invalid dateTime")) };
         if old != new_time {
             let replace = unsafe { args.on_conflict(self.connection) } == vtab::ConflictMode::Replace;
@@ -137,15 +164,27 @@ unsafe impl VTabCursor for ArchiveCursor {
         let mut lower = None;
         let mut upper = None;
         let mut store = guard(&self.store)?;
-        let columns = store.columns(&self.table).map_err(error)?;
+        let columns = store.column_defs(&self.table).map_err(error)?;
         let ts = columns.iter().position(|c|c.name == "dateTime").unwrap();
-        let plan: Vec<(i32,String)> = serde_json::from_str(plan.unwrap_or("[]")).map_err(error)?;
-        let mut argument = 0;
+        let (plan, order) = plan.unwrap_or("|").split_once('|').ok_or_else(|| error("invalid index plan"))?;
+        let plan = plan.split(',').filter(|s| !s.is_empty()).map(|item| {
+            let (ci, op) = item.split_once(':').ok_or_else(|| error("invalid index plan"))?;
+            Ok((ci.parse::<i32>().map_err(error)?, op.to_owned()))
+        }).collect::<rusqlite::Result<Vec<_>>>()?;
         let mut pruning = Vec::new();
-        for (ci,op) in plan {
-            let value = if op == "null" || op == "notnull" { Value::Null } else {
-                let value = args.get::<Value>(argument)?; argument += 1; value
-            };
+        let mut filters = Vec::new();
+        let (mut limit, mut offset) = (None, 0_usize);
+        // Every constraint has an argument, in plan order.
+        for (argument, (ci,op)) in plan.into_iter().enumerate() {
+            let value = args.get::<Value>(argument)?;
+            let value = if op == "null" || op == "notnull" { Value::Null } else { value };
+            if ci == -2 {
+                // A negative LIMIT means no limit; SQLite applies both itself.
+                let count = match value { Value::Integer(n) if n >= 0 => Some(n as usize), _ => None };
+                if op == "limit" { limit = count; } else { offset = count.unwrap_or(0); }
+                continue;
+            }
+            filters.push(crate::store::Filter { column: if ci == -1 { ts } else { ci as usize }, op: op.clone(), value: value.clone() });
             if (ci == ts as i32 || ci == -1) && let Value::Integer(time) = value {
                 match op.as_str() {
                     "eq" => { tighten_lower(&mut lower, time, true); tighten_upper(&mut upper, time, true); },
@@ -153,12 +192,33 @@ unsafe impl VTabCursor for ArchiveCursor {
                     "lt" => tighten_upper(&mut upper,time,false), "le" => tighten_upper(&mut upper,time,true), _ => (),
                 }
             }
-            if ci >= 0 && (columns[ci as usize].kind == Kind::Real || op == "null" || op == "notnull") {
+            // Block summaries prune comparisons that a NULL reading fails.
+            // IS and IS NOT can be true for NULL and are never pruned.
+            if ci >= 0 && op != "is" && op != "isnot" && (columns[ci as usize].kind == Kind::Real || op == "null" || op == "notnull") {
                 let numeric = match value { Value::Integer(n) => Some(n as f64), Value::Real(n) => Some(n), _ => None };
                 pruning.push((ci as usize,op,numeric));
             }
         }
-        let mut cursor = RowCursor::new_bounds(&store, &self.table, lower, upper).map_err(error)?;
+        let mut cursor = match order.split(':').collect::<Vec<_>>().as_slice() {
+            ["desc"] => RowCursor::new_reverse(&store, &self.table, lower, upper).map_err(error)?,
+            ["top", column, descending] => {
+                let column = column.parse::<usize>().map_err(error)?;
+                let descending = *descending == "1";
+                let workspace = store.workspace_bytes / 32;
+                let limit = limit.map(|n| n.saturating_add(offset));
+                let ordered = match limit {
+                    Some(limit) => store.ordered_times(&self.table, column, descending, (lower, upper), &filters, limit).map_err(error)?,
+                    None => None,
+                };
+                // Without an exact filter or limit, order every row in range
+                // and let SQLite recheck the WHERE terms.
+                let times = match ordered { Some(times) => times,
+                    None => store.ordered_times(&self.table, column, descending, (lower, upper), &[], workspace).map_err(error)?.unwrap_or_default() };
+                ensure_sql(times.len() < workspace || limit.is_some_and(|l| times.len() <= l), "ORDER BY workspace exceeded; increase workspace_mib or add a LIMIT")?;
+                RowCursor::new_times(&store, &self.table, times).map_err(error)?
+            }
+            _ => RowCursor::new_bounds(&store, &self.table, lower, upper).map_err(error)?,
+        };
         cursor.pruning = pruning;
         self.eof = !cursor.advance(&mut store).map_err(error)?;
         *self.cursor.get_mut() = Some(cursor);
@@ -172,8 +232,18 @@ unsafe impl VTabCursor for ArchiveCursor {
     fn column(&self, ctx: &mut vtab::Context, index: c_int) -> rusqlite::Result<()> {
         // SQLite's immutable callback still needs to cache projected columns.
         // Cursor-local interior mutability keeps the C layout and Rust aliases valid.
-        let value = self.cursor.borrow_mut().as_mut().ok_or_else(|| error("uninitialized cursor"))?.cell(&mut *guard(&self.store)?, index as usize).map_err(error)?;
-        ctx.set_result(&value.value())
+        let mut cursor = self.cursor.borrow_mut();
+        let cursor = cursor.as_mut().ok_or_else(|| error("uninitialized cursor"))?;
+        let value = match cursor.loaded_cell(index as usize) {
+            Some(value) => value,
+            None => cursor.cell(&mut *guard(&self.store)?, index as usize).map_err(error)?,
+        };
+        match value {
+            Cell::Integer(n) => ctx.set_result(&n),
+            Cell::Real(bits) => ctx.set_result(&f64::from_bits(bits)),
+            Cell::Null => ctx.set_result(&rusqlite::types::Null),
+            other => ctx.set_result(&other.value()),
+        }
     }
     fn rowid(&self) -> rusqlite::Result<i64> { Ok(self.cursor.borrow().as_ref().ok_or_else(|| error("uninitialized cursor"))?.time) }
 }
@@ -207,13 +277,101 @@ pub struct Session {
     metadata_dirty: bool,
     pub(crate) active_cursors: usize,
     pub(crate) closed: bool,
+    /// What a SQL text needs, decided once per text and schema.
+    plans: HashMap<String, Arc<Plan>>,
+    /// Reset statements of finished cursors, ready for the same SQL text.
+    pool: HashMap<String, Vec<cursor::RawStatement>>,
+    pooled: usize,
+    /// Changes whenever the frontend connection is replaced. A cursor only
+    /// returns its statement to the pool while the generation is unchanged.
+    pub(crate) generation: u64,
+    schema: (u64, u64),
 }
+
+/// How a SQL text runs. `direct` statements write or manage transactions and
+/// go through `Session::execute`; the others are read-only queries.
+pub(crate) struct Plan {
+    pub direct: bool,
+    pub parameters: usize,
+    pub columns: Vec<String>,
+    pub parsed: Option<Statement>,
+}
+
+const PLAN_LIMIT: usize = 512;
+const POOL_LIMIT: usize = 64;
 
 impl Session {
     pub fn open(path: &Path, cache_bytes: usize) -> Result<Self> {
         let store = Arc::new(Mutex::new(Store::open(path, cache_bytes)?));
         let connection = Self::frontend(&store)?;
-        Ok(Self { connection, store, explicit: false, metadata_dirty: false, active_cursors:0, closed:false })
+        let schema = schema_signature(&*guard(&store)?);
+        Ok(Self { connection, store, explicit: false, metadata_dirty: false, active_cursors:0, closed:false,
+            plans: HashMap::new(), pool: HashMap::new(), pooled: 0, generation: 0, schema })
+    }
+
+    /// Replace the frontend connection after a schema, metadata or rollback
+    /// change. Pooled statements belong to the old connection.
+    fn rebuild(&mut self) -> Result<()> {
+        self.forget_statements();
+        self.connection = Self::frontend(&self.store)?;
+        self.schema = schema_signature(&*guard(&self.store)?);
+        Ok(())
+    }
+
+    /// WeeWX rewrites a daily-summary metadata row with every archive record.
+    /// Refill those rows without replacing the connection.
+    fn reload_metadata(&mut self) -> Result<()> {
+        let metadata = guard(&self.store)?.snapshot.manifest.metadata.clone();
+        for table in &metadata {
+            self.connection.execute(&format!("DELETE FROM {}", quote(&table.name)), [])?;
+            if table.rows.is_empty() { continue; }
+            let mut insert = self.connection.prepare_cached(&format!("INSERT INTO {} VALUES ({})", quote(&table.name), vec!["?"; table.rows.first().map_or(0, Vec::len)].join(",")))?;
+            for row in &table.rows { insert.execute(params_from_iter(row.iter().map(Cell::value)))?; }
+        }
+        Ok(())
+    }
+
+    fn forget_statements(&mut self) {
+        for (_, statements) in self.pool.drain() { for statement in statements { statement.finalize(); } }
+        self.pooled = 0;
+        self.plans.clear();
+        self.generation += 1;
+    }
+
+    pub(crate) fn plan(&mut self, sql: &str) -> Result<Arc<Plan>> {
+        if let Some(plan) = self.plans.get(sql) { return Ok(plan.clone()); }
+        let direct = managed(sql)? || simple_write(sql);
+        let plan = if direct { Plan { direct, parameters: 0, columns: vec![], parsed: None } } else {
+            let prepared = self.connection.prepare_cached(sql)?;
+            let readonly = prepared.readonly();
+            let parameters = prepared.parameter_count();
+            let columns = prepared.column_names().into_iter().map(str::to_owned).collect();
+            drop(prepared);
+            // Parsed once per SQL text; kept only for statements the native
+            // path could answer.
+            let parsed = if readonly {
+                let statements = Parser::parse_sql(&SQLiteDialect {},sql).ok();
+                if let Some(statements) = &statements { ensure!(statements.len()==1,"execute accepts one SQL statement"); }
+                statements.and_then(|mut s| s.pop()).filter(fast::candidate)
+            } else { None };
+            Plan { direct: !readonly, parameters, columns, parsed }
+        };
+        if self.plans.len() >= PLAN_LIMIT { self.plans.clear(); }
+        let plan = Arc::new(plan);
+        self.plans.insert(sql.to_owned(), plan.clone());
+        Ok(plan)
+    }
+
+    pub(crate) fn take_statement(&mut self, sql: &str) -> Option<cursor::RawStatement> {
+        let statement = self.pool.get_mut(sql)?.pop()?;
+        self.pooled -= 1;
+        Some(statement)
+    }
+
+    pub(crate) fn return_statement(&mut self, sql: String, statement: cursor::RawStatement) {
+        if self.pooled >= POOL_LIMIT { statement.finalize(); return; }
+        self.pool.entry(sql).or_default().push(statement);
+        self.pooled += 1;
     }
 
     fn frontend(shared: &Shared) -> Result<Connection> {
@@ -241,7 +399,13 @@ impl Session {
         let before = { let store = guard(&self.store)?; (store.lsn(),store.snapshot.manifest.id.clone()) };
         guard(&self.store)?.refresh()?;
         let changed = { let store = guard(&self.store)?; (store.lsn(),store.snapshot.manifest.id.clone()) != before };
-        if changed { self.connection = Self::frontend(&self.store)?; }
+        // Archive rows are read live from the store. Only schema and metadata
+        // rows live in the frontend connection.
+        if changed {
+            let schema = schema_signature(&*guard(&self.store)?);
+            if schema.0 != self.schema.0 { self.rebuild()?; }
+            else if schema.1 != self.schema.1 { self.reload_metadata()?; self.schema = schema; }
+        }
         Ok(())
     }
 
@@ -271,7 +435,7 @@ impl Session {
             self.connection.execute_batch("ROLLBACK")?;
             guard(&self.store)?.rollback()?;
             self.explicit = false; self.metadata_dirty = false;
-            self.connection = Self::frontend(&self.store)?;
+            self.rebuild()?;
             return Ok(empty());
         }
         let ddl = parsed.as_ref().and_then(|s| s.first()).is_some_and(|s| matches!(s, Statement::CreateTable(_) | Statement::AlterTable {..} | Statement::Drop {..}));
@@ -292,7 +456,7 @@ impl Session {
                 if automatic {
                     let _ = self.connection.execute_batch("ROLLBACK");
                     guard(&self.store)?.rollback()?;
-                    self.connection = Self::frontend(&self.store)?;
+                    self.rebuild()?;
                 } else if self.explicit { guard(&self.store)?.restore_statement(point)?; }
                 Err(error)
             }
@@ -319,10 +483,11 @@ impl Session {
         if let Err(error) = committed {
             guard(&self.store)?.rollback()?;
             self.explicit = false; self.metadata_dirty = false;
-            self.connection = Self::frontend(&self.store)?;
+            self.rebuild()?;
             return Err(error);
         }
         self.explicit = false; self.metadata_dirty = false;
+        self.schema = schema_signature(&*guard(&self.store)?);
         Ok(())
     }
 
@@ -349,6 +514,7 @@ impl Session {
     }
 
     fn ddl(&mut self, statement: &Statement, sql: &str) -> Result<QueryResult> {
+        self.forget_statements();
         match statement {
             Statement::CreateTable(create) => {
                 let name = create.name.to_string();
@@ -459,7 +625,7 @@ impl Session {
         ensure!(!self.explicit, "checkpoint cannot run in a transaction");
         ensure!(self.active_cursors == 0,"close streaming read cursors before checkpointing");
         guard(&self.store)?.checkpoint(rebuild)?;
-        self.connection = Self::frontend(&self.store)?;
+        self.rebuild()?;
         Ok(())
     }
 
@@ -518,6 +684,26 @@ pub fn statements(sql: &str) -> Result<Vec<&str>> {
     let tail = sql[start..].trim();
     if !without_comments(tail).is_empty() { parts.push(tail); }
     Ok(parts)
+}
+
+/// Hashes of what the frontend connection copies from the store: first the
+/// table definitions, then the metadata rows.
+fn schema_signature(store: &Store) -> (u64, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut structure = std::collections::hash_map::DefaultHasher::new();
+    let mut rows = std::collections::hash_map::DefaultHasher::new();
+    let manifest = &store.snapshot.manifest;
+    manifest.id.hash(&mut structure);
+    for table in &manifest.tables { table.name.hash(&mut structure); table.sql.hash(&mut structure); table.columns.len().hash(&mut structure); }
+    for table in &manifest.metadata {
+        table.name.hash(&mut structure); table.sql.hash(&mut structure);
+        serde_json::to_vec(&table.rows).unwrap_or_default().hash(&mut rows);
+    }
+    (structure.finish(), rows.finish())
+}
+
+impl Drop for Session {
+    fn drop(&mut self) { self.forget_statements(); }
 }
 
 fn empty() -> QueryResult { QueryResult { columns: vec![], rows: vec![], changes: 0, engine: "rust-journal".to_owned() } }

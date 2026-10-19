@@ -12,6 +12,7 @@ import configobj
 import pytest
 import weecfg.extension
 import weewx
+import weewx.manager
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,6 +38,8 @@ def test_real_extension_install_offline_import_cli_and_uninstall(tmp_path):
         'WEEWX_ROOT': str(station), 'StdReport': {'HTML_ROOT': 'public_html', 'SKIN_ROOT': 'skins'},
         'Engine': {'Services': {name: [] for name in weewx.all_service_groups}},
         'DataBindings': {'wx_binding': {'database': 'archive_sqlite'}},
+        # Package installations keep SQLite databases outside WEEWX_ROOT.
+        'DatabaseTypes': {'SQLite': {'driver': 'weedb.sqlite', 'SQLITE_ROOT': str(tmp_path / 'var-lib-weewx')}},
         'Databases': {'archive_sqlite': {'driver': 'weedb.sqlite', 'database_name': 'original.sdb'}}}, interpolation=False)
     configuration.filename = str(station / 'weewx.conf')
     configuration.write()
@@ -44,6 +47,13 @@ def test_real_extension_install_offline_import_cli_and_uninstall(tmp_path):
     engine.install_extension(str(archive), no_confirm=True)
     assert configuration['DataBindings']['wx_binding']['database'] == 'archive_sqlite'
     assert configuration['Databases']['weewx_rust']['driver'] == 'user.weewxdb.driver'
+    # The database opens with its own driver and the station's SQLite directory.
+    database = weewx.manager.get_database_dict_from_config(configuration, 'weewx_rust')
+    assert database['driver'] == 'user.weewxdb.driver'
+    assert database['SQLITE_ROOT'] == str(tmp_path / 'var-lib-weewx')
+    # Belchertown chooses its SQL dialect from the driver of database_type.
+    database_type = configuration['Databases']['weewx_rust']['database_type']
+    assert configuration['DatabaseTypes'][database_type]['driver'] == 'weedb.sqlite'
     assert configuration['Engine']['Services']['xtype_services'] == ['user.weewxdb.services.NativeServices']
     runtime = station / 'bin/user/weewxdb'
     assert not (runtime / 'jsongenerator.py').exists()

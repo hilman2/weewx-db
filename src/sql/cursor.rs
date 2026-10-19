@@ -5,13 +5,27 @@ use std::collections::VecDeque;
 use std::ptr;
 use rusqlite::ffi;
 
+/// A prepared statement owned by one session's frontend connection.
+pub(crate) struct RawStatement(*mut ffi::sqlite3_stmt);
+
+// Statements are only used while holding the session mutex.
+unsafe impl Send for RawStatement {}
+
+impl RawStatement {
+    pub(crate) fn finalize(self) { unsafe { ffi::sqlite3_finalize(self.0); } }
+}
+
 pub struct Cursor {
     session: Arc<Mutex<Session>>,
     statement: *mut ffi::sqlite3_stmt,
+    /// SQL text and frontend generation of `statement`, for returning it to
+    /// the session's pool once the result is exhausted or closed.
+    origin: Option<(String, u64)>,
     rows: VecDeque<Vec<Cell>>,
     pub columns: Vec<String>,
     pub rowcount: i64,
     pub engine: String,
+    pub in_transaction: bool,
 }
 
 // The statement never outlives its connection: the Arc owns that connection.
@@ -22,46 +36,44 @@ impl Cursor {
     pub fn open(session: Arc<Mutex<Session>>, sql: &str, parameters: &[Cell]) -> Result<Self> {
         let mut locked = session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
         locked.refresh()?;
-        if managed(sql)? || simple_write(sql) {
+        let plan = locked.plan(sql)?;
+        if plan.direct {
             let result = locked.execute(sql,parameters)?;
+            let in_transaction = locked.in_transaction();
             drop(locked);
-            return Ok(Self { session,statement:ptr::null_mut(),rows:result.rows.into(),columns:result.columns,rowcount:result.changes as i64,engine:result.engine });
+            return Ok(Self { session,statement:ptr::null_mut(),origin:None,rows:result.rows.into(),columns:result.columns,rowcount:result.changes as i64,engine:result.engine,in_transaction });
         }
-        let prepared = locked.connection.prepare_cached(sql)?;
-        ensure!(prepared.parameter_count() == parameters.len(),"incorrect number of SQL bindings");
-        let readonly = prepared.readonly();
-        drop(prepared);
-        if !readonly {
-            let result = locked.execute(sql,parameters)?;
+        ensure!(plan.parameters == parameters.len(),"incorrect number of SQL bindings");
+        let in_transaction = locked.in_transaction();
+        let native = match &plan.parsed {
+            Some(statement) => { let mut store = guard(&locked.store)?; fast::query(&mut store,statement,parameters)? }
+            None => None,
+        };
+        if let Some(rows) = native {
             drop(locked);
-            return Ok(Self { session,statement:ptr::null_mut(),rows:result.rows.into(),columns:result.columns,rowcount:result.changes as i64,engine:result.engine });
+            return Ok(Self { session,statement:ptr::null_mut(),origin:None,rows:rows.into(),columns:plan.columns.clone(),rowcount:-1,engine:"rust-native".into(),in_transaction });
         }
-        let parsed = if sql.contains('(') { Parser::parse_sql(&SQLiteDialect {},sql).ok() } else { None };
-        if let Some(statements) = &parsed { ensure!(statements.len()==1,"execute accepts one SQL statement"); }
-        if let Some(statement) = parsed.as_ref().and_then(|s|s.first()) {
-            let native = fast::query(&mut *guard(&locked.store)?,statement,parameters)?;
-            if let Some(rows) = native {
-                let columns = locked.connection.prepare(sql)?.column_names().into_iter().map(str::to_owned).collect();
-                drop(locked);
-                return Ok(Self { session,statement:ptr::null_mut(),rows:rows.into(),columns,rowcount:-1,engine:"rust-native".into() });
+        let statement = match locked.take_statement(sql) {
+            Some(statement) => statement.0,
+            None => {
+                let text = CString::new(sql)?;
+                let mut statement = ptr::null_mut();
+                unsafe {
+                    let connection = locked.connection.handle();
+                    let status = ffi::sqlite3_prepare_v3(connection,text.as_ptr(),-1,ffi::SQLITE_PREPARE_PERSISTENT,&mut statement,ptr::null_mut());
+                    if status != ffi::SQLITE_OK { return Err(last_error(connection)); }
+                }
+                ensure!(!statement.is_null(),"SQL statement is empty");
+                statement
             }
-        }
-        let sql = CString::new(sql)?;
-        let mut statement = ptr::null_mut();
+        };
         // SQLite copies bound values using SQLITE_TRANSIENT. No Python or Rust
         // parameter buffer is retained beyond preparation.
-        unsafe {
-            let connection = locked.connection.handle();
-            let status = ffi::sqlite3_prepare_v3(connection,sql.as_ptr(),-1,0,&mut statement,ptr::null_mut());
-            if status != ffi::SQLITE_OK { return Err(last_error(connection)); }
-            ensure!(!statement.is_null(),"SQL statement is empty");
-            let binding = bind(statement,parameters);
-            if let Err(error) = binding { ffi::sqlite3_finalize(statement); return Err(error); }
-        }
-        let columns = unsafe { (0..ffi::sqlite3_column_count(statement)).map(|i| CStr::from_ptr(ffi::sqlite3_column_name(statement,i)).to_string_lossy().into_owned()).collect() };
+        if let Err(error) = unsafe { bind(statement,parameters) } { unsafe { ffi::sqlite3_finalize(statement); } return Err(error); }
         locked.active_cursors += 1;
+        let origin = Some((sql.to_owned(), locked.generation));
         drop(locked);
-        Ok(Self { session,statement,rows:VecDeque::new(),columns,rowcount:-1,engine:"sql-rust-storage".into() })
+        Ok(Self { session,statement,origin,rows:VecDeque::new(),columns:plan.columns.clone(),rowcount:-1,engine:"sql-rust-storage".into(),in_transaction })
     }
 
     pub fn fetchmany(&mut self, count: usize) -> Result<Vec<Vec<Cell>>> {
@@ -110,7 +122,14 @@ impl Cursor {
 
     fn finalize(&mut self, session: &mut Session) {
         if !self.statement.is_null() {
-            unsafe { ffi::sqlite3_finalize(self.statement); }
+            match self.origin.take() {
+                Some((sql, generation)) if generation == session.generation => unsafe {
+                    ffi::sqlite3_reset(self.statement);
+                    ffi::sqlite3_clear_bindings(self.statement);
+                    session.return_statement(sql, RawStatement(self.statement));
+                },
+                _ => unsafe { ffi::sqlite3_finalize(self.statement); },
+            }
             self.statement = ptr::null_mut();
             session.active_cursors -= 1;
         }

@@ -15,7 +15,7 @@ import weewxdb.almanac
 @pytest.mark.parametrize('stamp', [1704110400, 1718928000, 1734782400])
 @pytest.mark.parametrize('latitude,horizon,center', [(52, 0, False), (52, -6, True),
                                                     (52, -12, True), (52, -18, True),
-                                                    (69.65, 0, False)])
+                                                    (69.65, 0, False), (52, -6, 1)])
 def test_almanac_values_without_pyephem_calls(monkeypatch, body, stamp, latitude, horizon, center):
     almanac = weewx.almanac.Almanac(stamp, latitude, 13, altitude=155, horizon=horizon)
     monkeypatch.setattr(weewx.almanac, 'almanacs', [weewx.almanac.PyEphemAlmanacType()])
