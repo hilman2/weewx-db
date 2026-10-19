@@ -43,42 +43,14 @@ archive built for another system or architecture, so a mismatched download
 cannot break the installation.
 
 The installer places the extension under `bin/user/weewxdb` in your WeeWX root
-and adds a `weewx_rust` entry to `[Databases]` in `weewx.conf`. The paths below
-use a pip installation, where the WeeWX root is `~/weewx-data`. A package
-installation uses `/etc/weewx` for the root and `/var/lib/weewx` for databases.
+and adds a `weewx_rust` entry to `[Databases]` in `weewx.conf`. WeeWX keeps
+running on SQLite until you change a binding.
 
 ## Import and select your database
 
-Stop WeeWX, then import the SQLite archive into a new file. Import reads a
-consistent SQLite transaction, including committed WAL data. The destination
-must not exist. Use `import --table NAME` for another archive table name.
-
-```sh
-~/weewx-data/bin/user/weewxdb/weewx-db import ~/weewx-data/archive/weewx.sdb ~/weewx-data/archive/weewx.wwdb
-```
-
-Point the binding in `weewx.conf` to the new entry. Keep the existing manager
-and schema settings in the binding:
-
-```ini
-[DataBindings]
-    [[wx_binding]]
-        database = weewx_rust
-```
-
-On a package installation, also set `SQLITE_ROOT = /var/lib/weewx` in the
-`weewx_rust` entry so the file is found next to the SQLite archive.
-
-Start WeeWX. Other databases and bindings can continue to use SQLite. Keep the
-source database so you can compare reports. SQL queries use the bundled CLI,
-for example:
-
-```sh
-~/weewx-data/bin/user/weewxdb/weewx-db sql ~/weewx-data/archive/weewx.wwdb 'SELECT max(outTemp) FROM archive'
-```
-
-The [project README](https://github.com/hilman2/weewx-db#query-the-database)
-shows more CLI, maintenance and export commands.
+The [project README](https://github.com/hilman2/weewx-db#put-it-into-operation)
+walks through stopping WeeWX, importing the SQLite archive, pointing
+`wx_binding` at `weewx_rust`, checking the first records and switching back.
 
 ## Enable the JSON adapter
 
