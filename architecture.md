@@ -15,12 +15,13 @@ answer complete unaffected blocks without decoding them. The time index
 selects blocks and binary searches within them. Min/max and NULL counts also
 exclude blocks for observation filters; SQL rechecks the remaining rows.
 Columns are fetched only when projected. A bounded FIFO cache holds decoded
-columns. Schema additions synthesize missing old column blocks from a default.
+columns; connections to the same file share it. Schema additions synthesize missing old column blocks from a default.
 
 Changes live in a sorted overlay and a checksummed journal. A transaction
 becomes one frame. Readers merge the overlay with base blocks and suppress
 replaced or deleted readings before aggregation. The journal is replayed when
-opening or refreshing a connection. A truncated final frame is ignored.
+opening or refreshing a connection, starting after the frames another
+connection of the process has already replayed. A truncated final frame is ignored.
 The final frame from a background commit can also be discarded if torn;
 corruption in an earlier complete frame remains an error. New journals use
 WWXWAL03, whose frame checksum covers the synchronization flag, length,
@@ -34,6 +35,30 @@ publication leaves the previous checkpoint and journal available. A crash
 after publication can leave an old journal, whose sequence is recognized.
 Vacuum copies live blocks into a synchronized replacement file. Existing
 readers keep their old file descriptors until their snapshots finish.
+
+WeeWX opens new connections for every report run. Connections to the same
+file in one process therefore share what does not change between runs. A
+parsed and validated manifest is kept per file, inode and manifest position.
+Decoded column blocks live in one cache per file and inode, because a block
+never changes at its offset: checkpoints only append, and vacuum writes a new
+file. The replayed journal is shared too. A new connection continues from the
+replayed state when the snapshot, journal inode and journal base sequence
+match, and replays only the newer frames. Each frame's checksum is therefore
+verified once per process; a new process verifies the journal again. Each connection's own uncommitted
+changes stay private, because shared rows and schemas are copied on write.
+
+A process-wide change log records which table and time range every published
+transaction touched. Frames read during replay and own commits are recorded;
+checkpoints and vacuum record no data change. The WeeWX XType adapter keeps
+aggregate results per file and database identity, with the time ranges they
+read. A later revision reuses a result when the log shows no change in those
+ranges since it was computed. A sequence number missing from the log, for
+example a frame another process folded into a checkpoint, invalidates the
+result. Results are never used inside a transaction, and stateful weather
+providers bypass the cache. Spans ending within two days of the newest record
+mostly move with the report time; their results stay with one connection and
+revision. The other results are kept per database in two generations of
+`result_cache` entries.
 
 Files belonging to one database are the main `.wwdb` file and its `.wal`,
 `.head` and `.lock` sidecars. Do not copy the main file alone while writes run.

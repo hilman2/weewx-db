@@ -149,6 +149,8 @@ pub struct Store {
     /// Results of `aggregate` for the current snapshot and journal. Reports
     /// repeat queries such as the first and last timestamp many times.
     aggregates: HashMap<(usize, String, i64, i64, bool), Stats>,
+    /// Canonical path identifying this file in the process-wide change log.
+    canonical: PathBuf,
 }
 
 impl Store {
@@ -190,7 +192,8 @@ impl Store {
         let mut store = Self { snapshot, path: path.to_owned(), changes: BTreeMap::new(),
             lsn, valid_wal_bytes: 0, writer: None, pending: vec![], pending_bytes: 0,
             timeout: Duration::from_secs(5), stamp: [None, None], workspace_bytes: 32*1024*1024,
-            sync_mode:SyncMode::Always,pending_sync:None,last_relaxed:false,legacy_wal:false, aggregates: HashMap::new() };
+            sync_mode:SyncMode::Always,pending_sync:None,last_relaxed:false,legacy_wal:false, aggregates: HashMap::new(),
+            canonical: std::fs::canonicalize(path)? };
         store.replay()?;
         store.stamp = store.disk_stamp()?;
         drop(guard);
@@ -268,8 +271,13 @@ impl Store {
         let path = sidecar(&self.path, ".wal");
         if !path.exists() { self.valid_wal_bytes = 0; return Ok(()); }
         let mut input = File::open(path)?;
-        let length = input.metadata()?.len();
+        let metadata = input.metadata()?;
+        let length = metadata.len();
         if length == 0 { self.valid_wal_bytes = 0; return Ok(()); }
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
+        #[cfg(not(unix))]
+        let inode = 0;
         let mut magic = [0; 8];
         input.read_exact(&mut magic).context("truncated journal header")?;
         self.legacy_wal = &magic == b"WWXWAL02";
@@ -287,6 +295,20 @@ impl Store {
         ensure!(header.id == self.snapshot.manifest.id && header.base_lsn <= self.lsn, "journal database identity or sequence mismatch");
         self.valid_wal_bytes = input.stream_position()?;
         let mut previous = header.base_lsn;
+        // Continue from the state another connection of this process already
+        // replayed. A journal only grows at its inode, so the replayed prefix
+        // is unchanged; a reset journal is a new file.
+        let base = (self.snapshot.manifest.id.clone(), self.snapshot.manifest.lsn, inode, header.base_lsn, self.legacy_wal);
+        if let Some(state) = journals().lock().ok().and_then(|j| j.get(&self.canonical).filter(|s| s.base == base && s.valid <= length).cloned()) {
+            self.changes = state.changes;
+            self.snapshot.manifest = state.manifest;
+            self.lsn = state.lsn;
+            self.last_relaxed = state.last_relaxed;
+            self.aggregates.clear();
+            previous = state.previous;
+            input.seek(SeekFrom::Start(state.valid))?;
+            self.valid_wal_bytes = state.valid;
+        }
         loop {
             let offset = input.stream_position()?;
             if length - offset < 16 { break; }
@@ -315,13 +337,18 @@ impl Store {
             previous = lsn;
             if lsn > self.snapshot.manifest.lsn {
                 let operations: Vec<Mutation> = serde_json::from_slice(&data)?;
+                crate::changes::record(&self.canonical, &self.snapshot.manifest.id, lsn, touched(&operations));
                 for operation in operations { self.apply(&operation)?; }
                 self.lsn = lsn;
                 self.last_relaxed = relaxed;
             }
             self.valid_wal_bytes = input.stream_position()?;
         }
-        if previous < self.snapshot.manifest.lsn { self.valid_wal_bytes = 0; self.last_relaxed = false; }
+        if previous < self.snapshot.manifest.lsn { self.valid_wal_bytes = 0; self.last_relaxed = false; return Ok(()); }
+        if let Ok(mut journals) = journals().lock() {
+            journals.insert(self.canonical.clone(), JournalState { base, valid: self.valid_wal_bytes, previous, lsn: self.lsn,
+                last_relaxed: self.last_relaxed, changes: self.changes.clone(), manifest: self.snapshot.manifest.clone() });
+        }
         Ok(())
     }
 
@@ -388,6 +415,7 @@ impl Store {
                 wal.sync_data()?;
             }
             self.valid_wal_bytes = wal.metadata()?.len();
+            crate::changes::record(&self.canonical, &self.snapshot.manifest.id, lsn, touched(&self.pending));
             self.lsn = lsn;
         }
         self.pending.clear(); self.pending_bytes = 0;
@@ -431,24 +459,24 @@ impl Store {
             }
             Mutation::Create { name, sql, columns } => {
                 ensure!(!self.tables().contains(name), "table already exists: {name}");
-                self.snapshot.manifest.tables.push(Table { name: name.clone(), sql: sql.clone(), columns: columns.clone(), blocks: vec![], rows: 0 });
+                Arc::make_mut(&mut self.snapshot.manifest).tables.push(Table { name: name.clone(), sql: sql.clone(), columns: columns.clone(), blocks: vec![], rows: 0 });
             }
             Mutation::Metadata { name, sql, rows } => {
-                self.snapshot.manifest.metadata.retain(|t| t.name != *name);
-                self.snapshot.manifest.metadata.push(MetadataTable { name: name.clone(), sql: sql.clone(), rows: rows.clone() });
+                Arc::make_mut(&mut self.snapshot.manifest).metadata.retain(|t| t.name != *name);
+                Arc::make_mut(&mut self.snapshot.manifest).metadata.push(MetadataTable { name: name.clone(), sql: sql.clone(), rows: rows.clone() });
             }
             Mutation::Add { table, column, sql } => {
                 let ti = self.table_index(table)?;
                 ensure!(!self.snapshot.manifest.tables[ti].columns.iter().any(|c| c.name.eq_ignore_ascii_case(&column.name)), "duplicate column {}", column.name);
-                self.snapshot.manifest.tables[ti].columns.push(column.clone());
-                self.snapshot.manifest.tables[ti].sql = sql.clone();
+                Arc::make_mut(&mut self.snapshot.manifest).tables[ti].columns.push(column.clone());
+                Arc::make_mut(&mut self.snapshot.manifest).tables[ti].sql = sql.clone();
                 if let Some(changes) = self.changes.get_mut(table) {
                     for row in Arc::make_mut(changes).values_mut().flatten() { row.push(column.default.clone().unwrap_or(Cell::Null)); }
                 }
             }
             Mutation::Drop { table } => {
-                self.snapshot.manifest.tables.retain(|t| t.name != *table);
-                self.snapshot.manifest.metadata.retain(|t| t.name != *table);
+                Arc::make_mut(&mut self.snapshot.manifest).tables.retain(|t| t.name != *table);
+                Arc::make_mut(&mut self.snapshot.manifest).metadata.retain(|t| t.name != *table);
                 self.changes.remove(table);
             }
         }
@@ -721,7 +749,7 @@ impl Store {
     }
 
     fn checkpoint_locked(&mut self, rebuild_stats: bool) -> Result<()> {
-        let mut manifest = self.snapshot.manifest.clone();
+        let mut manifest = (*self.snapshot.manifest).clone();
         // Even an index-only optimization publishes a newer sequence number,
         // so an interrupted publication cannot make a reader select old data.
         manifest.lsn = self.lsn.checked_add(1).context("transaction sequence exhausted")?;
@@ -776,6 +804,8 @@ impl Store {
         pointer.persist(sidecar(&self.path, ".head"))?;
         sync_parent(&self.path)?;
         self.lsn = manifest.lsn;
+        // A checkpoint republishes the same data under a new sequence number.
+        crate::changes::record(&self.canonical, &manifest.id, manifest.lsn, vec![]);
         self.snapshot = Database::open(&self.path, self.snapshot.cache_limit)?;
         self.changes.clear();
         self.aggregates.clear();
@@ -798,7 +828,7 @@ impl Store {
         let guard = lock(&self.path,true,self.timeout)?;
         self.reload()?;
         self.checkpoint_locked(false)?;
-        let mut manifest = self.snapshot.manifest.clone();
+        let mut manifest = (*self.snapshot.manifest).clone();
         manifest.lsn = self.lsn.checked_add(1).context("transaction sequence exhausted")?;
         let mut output = tempfile::NamedTempFile::new_in(parent(&self.path))?;
         output.write_all(&[0; HEADER_BYTES as usize])?;
@@ -828,6 +858,7 @@ impl Store {
         self.snapshot = Database::open(&self.path,self.snapshot.cache_limit)?;
         self.aggregates.clear();
         self.lsn = manifest.lsn;
+        crate::changes::record(&self.canonical, &manifest.id, manifest.lsn, vec![]);
         self.reset_wal()?;
         self.stamp = self.disk_stamp()?;
         drop(guard);
@@ -865,6 +896,59 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) { let _ = self.flush(); }
+}
+
+/// A replayed journal: the published snapshot and journal it starts from,
+/// how far it was read, and the resulting rows and schema.
+#[derive(Clone)]
+struct JournalState {
+    /// Database id and snapshot sequence, journal inode, journal base
+    /// sequence and whether the journal has the legacy format.
+    base: (String, u64, u64, u64, bool),
+    valid: u64,
+    previous: u64,
+    lsn: u64,
+    last_relaxed: bool,
+    changes: Changes,
+    manifest: Arc<Manifest>,
+}
+
+/// Forget the replayed journal this process keeps for `path`, as a new
+/// process would. Frames are verified once per process; tests use this to
+/// check how a fresh process treats a damaged journal.
+#[doc(hidden)]
+pub fn forget_replayed_journal(path: &Path) {
+    if let (Ok(path), Ok(mut journals)) = (std::fs::canonicalize(path), journals().lock()) { journals.remove(&path); }
+}
+
+fn journals() -> &'static std::sync::Mutex<HashMap<PathBuf, JournalState>> {
+    static JOURNALS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, JournalState>>> = std::sync::OnceLock::new();
+    JOURNALS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The tables and time ranges a transaction's mutations change.
+fn touched(operations: &[Mutation]) -> Vec<crate::changes::Range> {
+    let mut ranges: Vec<crate::changes::Range> = Vec::new();
+    for operation in operations {
+        let (table, first, last) = match operation {
+            Mutation::Put { table, time, .. } => (table, *time, *time),
+            Mutation::Create { name, .. } | Mutation::Metadata { name, .. } => (name, i64::MIN, i64::MAX),
+            Mutation::Add { table, .. } | Mutation::Drop { table } => (table, i64::MIN, i64::MAX),
+        };
+        match ranges.iter_mut().find(|(name, ..)| name == table) {
+            Some(range) => { range.1 = range.1.min(first); range.2 = range.2.max(last); }
+            None => ranges.push((table.clone(), first, last)),
+        }
+    }
+    ranges
+}
+
+impl Store {
+    /// Whether the transactions after `since` left `table` within `lo..=hi`
+    /// unchanged. False inside a transaction or when this process cannot tell.
+    pub fn unchanged_since(&self, since: u64, table: &str, lo: i64, hi: i64) -> bool {
+        !self.in_transaction() && crate::changes::unchanged(&self.canonical, &self.snapshot.manifest.id, since, self.lsn, table, lo, hi)
+    }
 }
 
 fn validate_cell(column: &Column, value: &Cell) -> Result<()> {

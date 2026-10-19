@@ -8,6 +8,7 @@ import weedb.sqlite
 
 from . import connect as db_connect, IntegrityError, ProgrammingError, DatabaseError
 from . import _weewxdb
+from .native import RESULT_GENERATION
 
 
 def guard(function):
@@ -71,6 +72,8 @@ class Connection(weedb.Connection):
                                      sync_mode=options.get('sync_mode', 'background'))
         super().__init__(connection, database_name, 'sqlite')
         self.native = connection.native
+        # Aggregate results kept per generation for this database; 0 disables.
+        self.result_cache = int(options.get('result_cache', RESULT_GENERATION))
         from . import xtypes
         xtypes.register()
 

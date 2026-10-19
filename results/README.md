@@ -85,6 +85,63 @@ Sun and Moon positions match PyEphem's time within one percent. Fetching the
 newest record or the first and last timestamps through WeeWX's manager stays
 within one microsecond of SQLite.
 
+## Report cycles with new records, 19 October 2026
+
+WeeWX adds an archive record and then runs its reports with new database
+connections. These runs repeat that cycle: a writer connection adds one
+record before each of seven repeated runs. Every process runs on one of the
+equal 3.35 GHz cores 4 to 11, so these times are not comparable with the
+section above. The archive and skins are the same.
+
+New connections now share the parsed index, the replayed journal and the
+decoded blocks of their file within the process. On core 4, every connection
+to the ten-year archive took 34 ms before. Now the first connection of a
+process takes 24 ms and every further one 2.2 ms. With 400 records, about
+4 MB, in the journal, every connection took 63 to 85 ms before and further
+ones now take 2.4 ms. Aggregate results are also kept across connections
+while the change log shows no new data in their time range; `result_cache`
+sets how many.
+
+Median repeated run in seconds, and peak process memory in MiB:
+
+| Skin | SQLite | Before | Shared, no cache | Cache 4096 | Cache 16384 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Seasons | 0.719 | 0.522 | 0.481 | 0.467 | 0.466 |
+| Belchertown | 0.406 | 0.373 | 0.346 | 0.319 | 0.321 |
+| Neowx-Material | 1.555 | 1.062 | 1.036 | 1.065 | 0.992 |
+| Weather Data Center | 3.965 | 3.389 | 3.346 | 3.388 | 3.350 |
+
+| Skin | SQLite | Before | Shared, no cache | Cache 4096 | Cache 16384 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Seasons | 61 | 89 | 88 | 92 | 106 |
+| Belchertown | 63 | 94 | 84 | 89 | 105 |
+| Neowx-Material | 50 | 107 | 108 | 113 | 130 |
+| Weather Data Center | 58 | 130 | 115 | 122 | 142 |
+
+Sharing alone speeds up every repeated run and keeps memory equal or lower.
+The default cache of 4096 results adds the remaining gain for Seasons and
+Belchertown at 4 to 7 MiB. Neowx-Material asks for about 15,500 results of
+past periods per run and needs 16,384 to reuse them. In each run it also asks
+for about 5,400 spans that end within two days and move with the report
+time; no cache can reuse those.
+
+With the default cache, complete first runs took between 5 percent less and
+9 percent more time than without one; almost every result in them is new.
+They are single samples. Rust uses more memory than SQLite in every variant.
+
+After a new record, the aggregates still computed in Rust took 5 to 7 ms of
+a repeated Seasons or Belchertown run, 294 to 464 queries. Maintaining
+statistics while records are written could save at most that. Neowx-Material
+computed 9,500 to 14,700 aggregates, 60 to 90 ms, mostly for the moving spans
+above, which no precomputed statistic covers.
+
+A per-run memory for template tags that keeps WeeWX's tag syntax was also
+measured and left out. It saved 9 percent of Neowx-Material's complete run
+but made its repeated runs 15 percent slower. Cheetah probes the binder
+objects hundreds of thousands of times per run, and intercepting those
+lookups in Python cost more than the repeated tags it saved. The
+[raw report](v4-report-cycles.json) lists every sample.
+
 ## Complete JSON generation
 
 The JSON generator and its WeeWX dependencies come from
@@ -505,6 +562,11 @@ for skin in Seasons Belchertown neowx-material weewx-wdc; do
     done
 done
 ```
+
+Add `--advance` to write one record before each repeated run, and
+`--result-cache N` to set the driver option for the Rust engine. Pin each
+process to a core of the same type; on this host cores 0 to 3 run at
+5.3 GHz and cores 4 to 11 at 3.35 GHz.
 
 The earlier read-only, uncompressed prototype's reports remain available:
 [no cache](desktop-0mib.json), [1 MiB](desktop-1mib.json),

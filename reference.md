@@ -151,13 +151,19 @@ DB-API connection, or export a SQLite file for tools that require that format.
 
 | Driver / Python option | Default | Meaning |
 | --- | --- | --- |
-| `cache_mib` | 32 | Maximum cached, decompressed column bytes; zero disables this cache |
+| `cache_mib` | 32 | Maximum cached, decompressed column bytes; connections to the same file in one process share the largest requested cache, and zero for all of them disables it |
 | `workspace_mib` | 32 | Budget for native interval results, rolling windows, materialized SQL cells, fetch batches and exact percentiles |
+| `result_cache` | 4096 | weedb driver only: aggregate results kept per database and generation, at most two generations; zero disables the cache |
 | `timeout` | 5 | Maximum seconds waiting for the database writer lock |
 | `sync_mode` | background | Journal synchronization policy |
 
+Aggregate results let report runs reuse statistics of periods that received
+no new data. Skins with many statistics pages, such as Neowx-Material, reuse
+more results with `result_cache = 16384`, at about 20 MiB more memory.
+
 SQL and batch CLI commands expose `--cache-mib` and `--workspace-mib`.
-Budgets are per connection or operation, not a total RSS cap. Indices, the
+The workspace budget is per connection or operation, the cache budget per file
+and process; neither is a total RSS cap. Indices, the
 journal overlay, Python objects, concurrent aggregate groups, SQLite workspace
 and the OS file cache use additional memory. SQLite temporary sorts may spill
 to disk. XType exact percentiles share one sample budget across all output
