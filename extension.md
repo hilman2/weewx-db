@@ -2,8 +2,8 @@
 
 The extension installs the Rust database, SQL CLI, weedb driver, XTypes and
 solar/lunar almanac together on WeeWX 5. It does not include a JSON generator.
-The bundled JSON adapter extends the generator that ships with WeeWX 5.6 and
-cannot be enabled on earlier releases.
+JSON reports use the generator that ships with WeeWX 5.6. The bundled
+subclass of it is optional and cannot be enabled on earlier releases.
 
 ## Choose a release package
 
@@ -52,24 +52,24 @@ The [project README](https://github.com/hilman2/weewx-db#put-it-into-operation)
 walks through stopping WeeWX, importing the SQLite archive, pointing
 `wx_binding` at `weewx_rust`, checking the first records and switching back.
 
-## Enable the JSON adapter
+## Choose stored or calculated values in JSON reports
 
-This step needs WeeWX 5.6 or later, which provides `weewx.jsongenerator`. The
-adapter subclasses that generator and batches its database requests through
-the Rust backend. File names, output format and incremental updates stay with
-WeeWX. The adapter adds a per-line `source` policy and a cache size.
+JSON reports need no change to read from the Rust database. WeeWX 5.6's
+`weewx.jsongenerator.JSONGenerator` reaches it through the driver.
 
-In the report's `skin.conf`, replace `weewx.jsongenerator.JSONGenerator` in
-`[Generators] generator_list` with `user.weewxdb.json.JSONGenerator`. Keep the
-other generators in the list. Configure the report through WeeWX's existing
+The extension's subclass of that generator adds a per-line `source` policy. It
+also calculates the day/night files from the Rust solar ephemeris. To use it,
+replace `weewx.jsongenerator.JSONGenerator` in `[Generators] generator_list` of
+the report's `skin.conf` with `user.weewxdb.json.JSONGenerator`. Keep the other
+generators in the list. Configure the report through WeeWX's existing
 `[JSONGenerator]` options.
 
 A line can select `source = derived` to calculate values even when the schema
 contains the observation, or `source = fill_missing` to keep stored non-NULL
 values and calculate the gaps. The default `auto` follows ordinary WeeWX
 selection. Explicit source policies use archive records.
-See the [batch API reference](batch.md#weewx-56-json-integration) for the cache
-option, supported aggregates and the compatibility check.
+See the [batch API reference](batch.md#weewx-56-json-integration) for the
+supported aggregates and the compatibility check.
 
 ## Enable packet calculations
 

@@ -116,13 +116,11 @@ class NativeXType(weewx.xtypes.XType):
                 # Daily extrema may originate in LOOP packets. They cannot be
                 # replaced by extrema calculated only from archive records.
                 raise weewx.UnknownAggregation(aggregate_type)
-        ranges = [(math.floor(span.start), math.floor(span.stop))
-                  for span in weeutil.weeutil.intervalgen(
-                      start, stop, aggregate_interval)
+        ranges = [(a, b) for a, b in calculations.intervals(start, stop, aggregate_interval)
                   if db_manager.first_timestamp is not None
-                  and span.stop > db_manager.first_timestamp
+                  and b > db_manager.first_timestamp
                   and db_manager.last_timestamp is not None
-                  and span.start < db_manager.last_timestamp]
+                  and a < db_manager.last_timestamp]
         if computed is None:
             values = native.series(db_manager.table_name, obs_type, ranges, aggregate_type)
             unit_system = db_manager.std_unit_system

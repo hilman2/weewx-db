@@ -1,18 +1,14 @@
-"""Batch adapter for the JSON generator shipped with WeeWX 5.6."""
+"""Source policies for the JSON generator shipped with WeeWX 5.6."""
 
-import bisect
 import inspect
-import json
 import logging
 import os
 import time
 
 import weeutil.weeutil
-import weewx
-from weeutil.weeutil import TimeSpan
 
 from . import astronomy, native
-from .batch import ReportCache, get_series_many
+from .batch import get_series_many
 
 try:
     from weewx import jsongenerator as base
@@ -31,76 +27,18 @@ def _request(line, span, aggregate=None, interval=None, raw=False):
             'interval': None if raw else interval or line['aggregate_interval'], 'options': options}
 
 
-def _key(manager, request):
-    return id(manager), json.dumps(request, sort_keys=True, default=list)
-
-
 class JSONGenerator(base.JSONGenerator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        expected = {'plot_dict', 'plot_options', 'timespan', 'interval', 'rounding',
-                    'group_name', 'first_ts', 'last_ts', 'old_file', 'extremes', 'raw'}
-        archive_method = getattr(base.JSONGenerator, '_archive_file', None)
-        self._batch_supported = callable(archive_method) and expected <= set(inspect.signature(archive_method).parameters) \
-            and all(hasattr(base, name) for name in ['_extends', '_line_spec', '_intervals'])
-        if not self._batch_supported:
-            log.warning('Unrecognized WeeWX JSON generator interface; using ordinary XType dispatch')
-            for name in ['_archive_file', '_archive_series', '_aggregate_line', '_archive_daynight']:
+        expected = {'line', 'plot_options', 'mgr', 'timespan', 'aggregate_type',
+                    'aggregate_interval', 'raw'}
+        method = getattr(base.JSONGenerator, '_aggregate_line', None)
+        self._supported = callable(method) and expected <= set(inspect.signature(method).parameters)
+        if not self._supported:
+            log.warning('Unrecognized WeeWX JSON generator interface; ignoring source policies')
+            for name in ['_archive_series', '_aggregate_line', '_archive_daynight']:
                 if hasattr(base.JSONGenerator, name):
                     setattr(self, name, getattr(super(), name))
-        self._prefetched = {}
-        self._report_cache = ReportCache(int(float(self.skin_dict.get('JSONGenerator', {}).get('native_cache_mib', 8)) * 1024 * 1024))
-
-    def _archive_file(self, plot_dict, plot_options, timespan, interval, rounding,
-                      group_name, first_ts, last_ts, old_file=None, extremes=(), raw=False):
-        if self._batch_supported:
-            lo, hi = max(timespan.start, int(first_ts)), min(timespan.stop, int(last_ts) + interval)
-            start, stop = int(lo // interval * interval), int(-(-hi // interval) * interval)
-            count = (stop - start) // interval
-            previous = old_file if old_file is not None and base._extends(old_file, start, interval, count) else None
-            groups = {}
-            if count >= 2:
-                for name in plot_dict.sections:
-                    line = base._line_spec(plot_dict[name], name, interval)
-                    manager = self.db_binder.get_manager(line['options']['data_binding'])
-                    if getattr(manager.connection, 'native', None) is None:
-                        continue
-                    if previous is None and line['data_type'] in manager.sqlkeys \
-                            and line['options'].get('source', 'auto') in ['auto', 'stored'] \
-                            and base._skip_if_empty(manager, line['data_type'], base._whole_days(start, stop)):
-                        continue
-                    def resume(seconds):
-                        if previous is None:
-                            return start
-                        key = (start, stop, seconds, previous['newest'])
-                        if key not in self._archive_resume:
-                            begins, ends = base._intervals(start, stop, seconds)
-                            i = bisect.bisect_left(ends, previous['newest'])
-                            if len(self._archive_resume) >= 32:
-                                self._archive_resume.clear()
-                            self._archive_resume[key] = begins[i] if i < len(begins) else stop
-                        return self._archive_resume[key]
-                    unaggregated = raw and line['aggregate_interval'] == interval
-                    requests = [_request(line, TimeSpan(resume(line['aggregate_interval']), stop), raw=unaggregated)]
-                    if line['var_type'] in extremes and not unaggregated and not line['vector'] \
-                            and line['aggregate_type'] not in ['min', 'max', 'vecdir']:
-                        requests.extend(_request(line, TimeSpan(resume(interval), stop), which, interval)
-                                        for which in ['min', 'max'])
-                    for request in requests:
-                        try:
-                            native.prepare_series(request['observation'], request['span'], manager,
-                                                  request['aggregate'], request['interval'], **request['options'])
-                        except (weewx.UnknownType, weewx.UnknownAggregation):
-                            continue
-                        groups.setdefault(manager, {})[_key(manager, request)] = request
-                for manager, requests in groups.items():
-                    values = get_series_many(list(requests.values()), manager, self._report_cache)
-                    self._prefetched.update(zip(requests, values))
-        try:
-            return super()._archive_file(plot_dict, plot_options, timespan, interval, rounding,
-                                         group_name, first_ts, last_ts, old_file, extremes, raw)
-        finally:
-            self._prefetched.clear()
 
     def _archive_series(self, line, *args, **kwargs):
         # The generator's empty-sensor check also has to use the requested
@@ -113,12 +51,14 @@ class JSONGenerator(base.JSONGenerator):
 
     def _aggregate_line(self, line, plot_options, mgr, timespan, aggregate_type=None,
                         aggregate_interval=None, raw=False):
+        # A line without a source policy takes WeeWX's path, which reaches the
+        # engine through the driver's XType. A policy needs the native request,
+        # because it must fail rather than fall back to another source.
+        if line['options'].get('source', 'auto') == 'auto':
+            return super()._aggregate_line(line, plot_options, mgr, timespan, aggregate_type,
+                                           aggregate_interval, raw)
         request = _request(line, timespan, aggregate_type, aggregate_interval, raw)
-        result = self._prefetched.get(_key(mgr, request))
-        if result is None:
-            if request['options'].get('source', 'auto') == 'auto':
-                return super()._aggregate_line(line, plot_options, mgr, timespan, aggregate_type, aggregate_interval, raw)
-            result = get_series_many([request], mgr, self._report_cache)[0]
+        result = get_series_many([request], mgr)[0]
         unit, values = self._convert(result[2], plot_options)
         return unit, list(zip(result[0][0], values))
 
@@ -130,17 +70,49 @@ class JSONGenerator(base.JSONGenerator):
             if os.path.exists(path) and span.stop <= last_ts:
                 continue
             result = daynight(span.start, min(span.stop, int(last_ts)),
-                              self.stn_info.latitude_f, self.stn_info.longitude_f)
+                              self.stn_info.latitude_f, self.stn_info.longitude_f, through=span.stop)
             if result is not None:
                 result['start'] = int(span.start)
                 base._write_json(path, result)
 
 
-def daynight(start, stop, latitude, longitude):
-    """Return horizon crossings and civil twilight in the generator's JSON format."""
-    common = dict(operation='events', start=start - 86400, stop=stop + 86400)
-    sun = astronomy(start, latitude, longitude, **common)
-    civil = astronomy(start, latitude, longitude, pressure=0, horizon=-6, center=True, **common)
+# The solar events of recent calls, keyed by (start, through, latitude, longitude).
+_events = {}
+
+
+def _solar_events(start, through, latitude, longitude):
+    """Return the sun's horizon and civil twilight events from start to through.
+
+    Returns:
+        tuple[dict, dict]: A two-way tuple (sun, civil), each holding 'rises' and
+            'sets' as timestamps, one day beyond either end.
+    """
+    key = (start, through, latitude, longitude)
+    if key not in _events:
+        if len(_events) >= 32:
+            _events.clear()
+        common = dict(operation='events', start=start - 86400, stop=through + 86400)
+        _events[key] = (astronomy(start, latitude, longitude, **common),
+                        astronomy(start, latitude, longitude, pressure=0, horizon=-6, center=True, **common))
+    return _events[key]
+
+
+def daynight(start, stop, latitude, longitude, through=None):
+    """Return horizon crossings and civil twilight in the generator's JSON format.
+
+    Args:
+        start (int): The beginning of the timespan.
+        stop (int): The end of the timespan.
+        latitude (float): The station latitude, in degrees.
+        longitude (float): The station longitude, in degrees.
+        through (int|None): Where the events are calculated to, at or after 'stop'.
+            The events of the year so far are then calculated once for the whole
+            year and kept for the next report. Default is 'stop'.
+
+    Returns:
+        dict|None: As weewx.jsongenerator._daynight() returns it.
+    """
+    sun, civil = _solar_events(start, stop if through is None else through, latitude, longitude)
     transitions = sorted(int(t + 0.5) for t in sun['rises'] + sun['sets'] if start < t < stop)
     if not transitions:
         return None

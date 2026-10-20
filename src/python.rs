@@ -371,6 +371,12 @@ fn astronomy(py:Python<'_>,specification:String)->PyResult<String>{
     py.detach(||->Result<String>{Ok(serde_json::to_string(&crate::astro::execute(&request)?)?)}).map_err(py_error)
 }
 
+#[cfg(unix)]
+#[pyfunction]
+fn local_intervals(py: Python<'_>, start: i64, stop: i64, interval: i64) -> PyResult<Vec<(i64,i64)>> {
+    py.detach(||crate::weather::local_intervals(start,stop,interval)).map_err(py_error)
+}
+
 #[pymodule]
 fn _weewxdb(module: &Bound<'_,PyModule>) -> PyResult<()> {
     module.add_class::<PyConnection>()?;
@@ -379,5 +385,7 @@ fn _weewxdb(module: &Bound<'_,PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(drop_database,module)?)?;
     module.add_function(wrap_pyfunction!(astronomy,module)?)?;
     module.add_function(wrap_pyfunction!(astronomy_native,module)?)?;
+    #[cfg(unix)]
+    module.add_function(wrap_pyfunction!(local_intervals,module)?)?;
     Ok(())
 }

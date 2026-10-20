@@ -29,6 +29,10 @@ SKINS = {
                                 'mqtt_websockets_enabled': '0', 'radar_html': ''}}),
     'neowx-material': ('neowx-material-source/src', None, 'neowx-material', {}),
     'weewx-wdc': ('wdc-source/skins/weewx-wdc', 'wdc-source/bin/user', 'WdcReport', {}),
+    # Needs PYTHONPATH=build/weewx-db-trial/json-source/src. A budget of 0 writes
+    # every archive file in the first run.
+    'Horizon': ('json-source/src/weewx_data/skins/Horizon', None, 'Horizon',
+                {'JSONGenerator': {'Archive': {'budget': '0'}}}),
 }
 
 
@@ -43,6 +47,7 @@ def main():
     parser.add_argument('--station', type=Path, default=ROOT / 'build/skin-runs')
     parser.add_argument('--advance', action='store_true', help='add one archive record before each repeated run')
     parser.add_argument('--result-cache', type=int, help='driver option result_cache for the rust engine')
+    parser.add_argument('--generators', help="replace the skin's generator_list, comma-separated")
     options = parser.parse_args()
     skin_path, user_path, report_name, report_options = SKINS[options.skin]
     station = (options.station / ('%s-%s' % (options.skin, options.engine))).resolve()
@@ -78,6 +83,8 @@ def main():
     # The installer's database_type tells Belchertown to use SQLite syntax.
     database['database_type'] = 'SQLite'
     report = dict(report_options, skin=options.skin, enable='true')
+    if options.generators:
+        report['Generators'] = {'generator_list': options.generators.split(',')}
     config = configobj.ConfigObj({
         'WEEWX_ROOT': str(station), 'USER_ROOT': 'bin/user', 'debug': 0,
         'Station': {'location': 'Benchmark', 'latitude': '52.0', 'longitude': '13.0', 'altitude': ['40', 'meter'],
