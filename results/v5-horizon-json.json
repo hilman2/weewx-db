@@ -1,0 +1,313 @@
+{
+  "date": "2026-10-20",
+  "archive": "tools/station_fixture.py, ten years, 1,051,200 five-minute records, wview_extended with daily summaries",
+  "generator": "weewx/weewx horizon-rework-v2 at e36b96441481581402dad759968df6077c96fc40 (src identical to json-source pin 28ac6ab8)",
+  "skins": {
+    "json": "Horizon, generator_list = weewx.jsongenerator.JSONGenerator, [[Archive]] budget = 0",
+    "full": "Horizon with its own generator_list",
+    "seasons": "Seasons"
+  },
+  "method": "tools/bench_skins.py --advance: one complete run, then repeated runs each after one new archive record",
+  "variants": {
+    "sqlite": "weedb.sqlite",
+    "rust": "Rust driver",
+    "adapter": "Rust driver with weewxdb.json.JSONGenerator",
+    "before": "main at c7b5329 plus the raw-series fix, without which day files differ",
+    "new": "this change"
+  },
+  "x86": {
+    "host": "AMD Ryzen AI 9 HX 470, one 3.35 GHz core per process (cores 4 to 9), Python 3.14",
+    "runs": 7,
+    "before": {
+      "json-sqlite": {
+        "complete_s": 14.514,
+        "repeated_s": [
+          0.118,
+          0.135,
+          0.165,
+          0.145,
+          0.113,
+          0.185,
+          0.117
+        ],
+        "peak_rss_mib": 45,
+        "files": 558
+      },
+      "json-rust": {
+        "complete_s": 6.74,
+        "repeated_s": [
+          0.102,
+          0.115,
+          0.172,
+          0.104,
+          0.16,
+          0.156,
+          0.11
+        ],
+        "peak_rss_mib": 106,
+        "files": 558
+      },
+      "json-adapter": {
+        "complete_s": 10.587,
+        "repeated_s": [
+          0.316,
+          0.302,
+          0.318,
+          0.266,
+          0.319,
+          0.329,
+          0.275
+        ],
+        "peak_rss_mib": 124,
+        "files": 558
+      },
+      "full-sqlite": {
+        "complete_s": 19.475,
+        "repeated_s": [
+          0.599,
+          0.585,
+          0.64,
+          0.572,
+          0.59,
+          0.658,
+          0.593
+        ],
+        "peak_rss_mib": 59,
+        "files": 796
+      },
+      "full-rust": {
+        "complete_s": 11.234,
+        "repeated_s": [
+          0.495,
+          0.516,
+          0.628,
+          0.502,
+          0.55,
+          0.565,
+          0.487
+        ],
+        "peak_rss_mib": 121,
+        "files": 796
+      },
+      "full-adapter": {
+        "complete_s": 15.142,
+        "repeated_s": [
+          0.644,
+          0.647,
+          0.68,
+          0.627,
+          0.66,
+          0.69,
+          0.631
+        ],
+        "peak_rss_mib": 135,
+        "files": 796
+      }
+    },
+    "after": {
+      "full-adapter": {
+        "files": 796,
+        "peak_rss_mib": 125,
+        "complete_s": 7.944,
+        "repeated_s": [
+          0.481,
+          0.505,
+          0.537,
+          0.488,
+          0.478,
+          0.524,
+          0.481
+        ]
+      },
+      "full-rust": {
+        "files": 796,
+        "peak_rss_mib": 123,
+        "complete_s": 6.85,
+        "repeated_s": [
+          0.513,
+          0.52,
+          0.543,
+          0.474,
+          0.482,
+          0.525,
+          0.466
+        ]
+      },
+      "full-sqlite": {
+        "files": 796,
+        "peak_rss_mib": 60,
+        "complete_s": 19.484,
+        "repeated_s": [
+          0.588,
+          0.59,
+          0.63,
+          0.586,
+          0.583,
+          0.65,
+          0.6
+        ]
+      },
+      "json-adapter": {
+        "files": 558,
+        "peak_rss_mib": 110,
+        "complete_s": 3.562,
+        "repeated_s": [
+          0.123,
+          0.124,
+          0.175,
+          0.135,
+          0.118,
+          0.167,
+          0.127
+        ]
+      },
+      "json-rust": {
+        "files": 558,
+        "peak_rss_mib": 108,
+        "complete_s": 2.439,
+        "repeated_s": [
+          0.118,
+          0.114,
+          0.163,
+          0.112,
+          0.127,
+          0.156,
+          0.118
+        ]
+      },
+      "json-sqlite": {
+        "files": 558,
+        "peak_rss_mib": 45,
+        "complete_s": 14.559,
+        "repeated_s": [
+          0.117,
+          0.124,
+          0.167,
+          0.117,
+          0.113,
+          0.174,
+          0.119
+        ]
+      }
+    }
+  },
+  "raspberry_pi": {
+    "host": "Raspberry Pi 4 Model B Rev 1.4, 2 GB, SD card, Debian 13, Python 3.13.5, core 3; under-voltage throttled the ARM clock to 600 MHz during every run (get_throttled 0x50005)",
+    "runs": 5,
+    "samples": {
+      "full-rust-new": {
+        "files": 796,
+        "peak_rss_mib": 114,
+        "complete_s": 119.766,
+        "repeated_s": [
+          8.735,
+          8.613,
+          9.346,
+          8.513,
+          8.528
+        ]
+      },
+      "full-rust": {
+        "files": 796,
+        "peak_rss_mib": 114,
+        "complete_s": 193.729,
+        "repeated_s": [
+          8.865,
+          8.789,
+          9.507,
+          8.66,
+          8.671
+        ]
+      },
+      "full-sqlite": {
+        "files": 796,
+        "peak_rss_mib": 51,
+        "complete_s": 335.009,
+        "repeated_s": [
+          12.683,
+          12.486,
+          13.388,
+          12.521,
+          12.567
+        ]
+      },
+      "json-rust-new": {
+        "files": 558,
+        "peak_rss_mib": 102,
+        "complete_s": 33.425,
+        "repeated_s": [
+          1.739,
+          1.741,
+          2.558,
+          1.747,
+          1.741
+        ]
+      },
+      "json-rust": {
+        "files": 558,
+        "peak_rss_mib": 101,
+        "complete_s": 105.277,
+        "repeated_s": [
+          1.75,
+          1.768,
+          2.567,
+          1.752,
+          1.757
+        ]
+      },
+      "json-sqlite": {
+        "files": 558,
+        "peak_rss_mib": 40,
+        "complete_s": 219.635,
+        "repeated_s": [
+          2.309,
+          2.288,
+          3.059,
+          2.3,
+          2.292
+        ]
+      },
+      "seasons-rust-new": {
+        "files": 193,
+        "peak_rss_mib": 82,
+        "complete_s": 76.188,
+        "repeated_s": [
+          6.356,
+          6.337,
+          6.397,
+          6.312,
+          6.316
+        ]
+      },
+      "seasons-rust": {
+        "files": 193,
+        "peak_rss_mib": 82,
+        "complete_s": 77.962,
+        "repeated_s": [
+          7.03,
+          7.023,
+          7.039,
+          6.997,
+          7.0
+        ]
+      },
+      "seasons-sqlite": {
+        "files": 193,
+        "peak_rss_mib": 50,
+        "complete_s": 102.736,
+        "repeated_s": [
+          9.48,
+          9.515,
+          9.526,
+          9.513,
+          9.531
+        ]
+      }
+    },
+    "encode_7mb_json_s": {
+      "iterencode": 7.49,
+      "dumps": 2.072
+    }
+  },
+  "checks": "tools/compare_reports.py: every JSON document equal to SQLite (adapter: except the documented daynight files); HTML equal apart from WeeWX uptime and float digits within 1e-14 relative"
+}

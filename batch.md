@@ -91,21 +91,21 @@ Python's allocator, the complete report, or process RSS.
 
 ## WeeWX 5.6 JSON integration
 
-`user.weewxdb.json.JSONGenerator` subclasses the installed generator and batches
-requests per archive file and binding. It requests primary, minimum and maximum
-series together where intervals match. The base generator retains file naming,
-conversion, incremental resume points and output serialization. Newly added
-series or changed units can request a complete series through the ordinary path.
+WeeWX's own `weewx.jsongenerator.JSONGenerator` reads through the driver's
+XType and needs no change. `user.weewxdb.json.JSONGenerator` subclasses it for
+two additions:
 
-`[JSONGenerator] native_cache_mib` sets the report cache size in MiB and defaults
-to 8. Zero disables retaining results.
+- A line with an explicit `source` policy requests its series natively, with
+  the policies above. Lines without one take the base generator's path. The
+  empty-sensor check of every line uses the line's policy.
+- Day/night files use the Rust solar ephemeris. Crossings use the upper solar
+  limb and atmospheric refraction; civil twilight uses the solar centre at -6
+  degrees without refraction. These event times differ from WeeWX's approximate
+  `weeutil.Sun` calculations. The events of the current year are calculated
+  once per process and reused by later reports.
 
-The adapter also builds day/night files using the Rust solar ephemeris.
-Crossings use the upper solar limb and atmospheric refraction; civil twilight
-uses the solar centre at -6 degrees without refraction. These event times differ
-from WeeWX's approximate `weeutil.Sun` calculations.
-
-The checked reference generator is pinned in `references.json`. The adapter
-checks its expected method signature and helper functions. If those change,
-batching is disabled with a log message. The final shipped WeeWX 5.6 generator
-still needs its own compatibility run when available.
+The base generator retains file naming, conversion, incremental resume points
+and output serialization. The checked reference generator is pinned in
+`references.json`. The adapter checks the signature of the generator's
+`_aggregate_line` method. If it changes, the adapter logs a message and leaves
+every line, and the day/night files, to the base generator.

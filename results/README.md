@@ -6,7 +6,8 @@ on this page use the standalone repository layout.
 These measurements use a synthetic ten-year archive with 1,051,200
 five-minute records, 32 observation columns and 16 active sensors. The host
 is Linux x86_64 on an AMD Ryzen AI 9 HX 470 with NVMe storage, Rust 1.99.0
-and Python 3.13.16. They are not Raspberry Pi measurements.
+and Python 3.13.16. Only the [Horizon section](#horizon-json-reports-20-october-2026)
+also covers a Raspberry Pi.
 
 ## Report skins, 19 October 2026
 
@@ -141,6 +142,90 @@ but made its repeated runs 15 percent slower. Cheetah probes the binder
 objects hundreds of thousands of times per run, and intercepting those
 lookups in Python cost more than the repeated tags it saved. The
 [raw report](v4-report-cycles.json) lists every sample.
+
+## Horizon JSON reports, 20 October 2026
+
+These runs generate the Horizon skin that comes with WeeWX 5.6. Its JSON files
+come from `weewx.jsongenerator.JSONGenerator`, its pages from Cheetah. The
+generator is the `horizon-rework-v2` branch of WeeWX at `e36b9644`; its `src`
+directory is identical to the `json-source` pin. The archive and method are
+those of the [report cycles](#report-cycles-with-new-records-19-october-2026)
+above: one complete run into an empty directory, then repeated runs that each
+follow one new archive record. `[[Archive]] budget = 0` lets the complete run
+write every archive file.
+
+The JSON-only runs keep only the JSONGenerator in `generator_list`. They write
+558 files, 7.0 MB, covering ten years at one or four hours, two months at 15
+minutes and 30 days at archive resolution, for every Horizon family the
+archive has data for. The full runs also write Horizon's pages, 796 files in
+total.
+
+"Before" is `main` at `c7b5329` with the raw-series fix of this change. Without
+that fix, every day file differs from SQLite: the driver read whole days of a
+raw series from the daily summaries, which hold no archive records. The day
+files of `windvec` were then missing, and with the JSON subclass every day file
+held only nulls.
+
+Seconds on the x86 host, one 3.35 GHz core per process, seven repeated runs:
+
+| Run | SQLite complete | Before | Now | SQLite repeated | Before | Now |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| JSON only | 14.559 | 6.740 | 2.439 | 0.119 | 0.115 | 0.118 |
+| JSON only, extension subclass | | 10.587 | 3.562 | | 0.316 | 0.127 |
+| Full Horizon | 19.484 | 11.234 | 6.850 | 0.590 | 0.516 | 0.513 |
+| Full Horizon, extension subclass | | 15.142 | 7.944 | | 0.647 | 0.488 |
+
+The same runs on a Raspberry Pi 4 Model B with 2 GB and an SD card, Debian 13
+and Python 3.13.5, on core 3, five repeated runs. Under-voltage throttled its
+ARM clock to 600 MHz instead of 1.8 GHz during every run, so absolute times are
+too high for a correctly powered Pi. All variants ran under the same
+condition:
+
+| Run | SQLite complete | Before | Now | SQLite repeated | Before | Now |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| JSON only | 219.6 | 105.3 | 33.4 | 2.30 | 1.76 | 1.74 |
+| Full Horizon | 335.0 | 193.7 | 119.8 | 12.57 | 8.79 | 8.61 |
+| Seasons | 102.7 | 78.0 | 76.2 | 9.52 | 7.02 | 6.34 |
+
+Every JSON document matched SQLite's after parsing, apart from the index's
+wall-clock `rebuilt` time. The extension subclass differs only in its
+day/night files, which it calculates from the Rust solar ephemeris. Pages
+differ only in WeeWX's uptime and in float digits below 1e-14 relative.
+`tools/compare_reports.py` performs these checks. Peak memory was 108 MiB for
+the Rust JSON run against 45 MiB on SQLite, and 102 against 40 MiB on the Pi.
+
+Two changes produce the complete-run gains. A series of a stored column is no
+longer planned twice, and the aggregation intervals are laid out in Rust
+instead of `weeutil.weeutil.intervalgen()`. The native layout matches WeeWX's
+across DST changes, including half-hour and non-hour offsets. The extension's
+JSON subclass no longer batches and caches requests, which had become slower
+than the driver's own path, and calculates the solar events of a year once per
+process.
+
+A repeated JSON run costs the same on both databases. In a profile of a repeated
+Rust run, writing the JSON files takes 25 percent, WeeWX's report setup 20 percent
+and the database requests 11 percent. The generator encodes through
+`json.JSONEncoder.iterencode()`, which CPython serves with its Python encoder
+rather than the C one. Encoding the 558 documents took 0.43 s that way and
+0.15 s with `json.dumps()`, with identical bytes; on the Pi 7.49 s and 2.07 s.
+`json.dumps()` held at most 280 KiB more for the largest file.
+
+All samples are in [the Horizon report](v5-horizon-json.json). Reproduce the
+x86 runs after the setup below:
+
+```sh
+for engine in sqlite rust; do
+    PYTHONPATH=build/weewx-db-trial/json-source/src python3 tools/bench_skins.py \
+        $engine Horizon build/station.sdb build/station.wwdb --runs 7 --advance \
+        --generators weewx.jsongenerator.JSONGenerator --station build/horizon
+done
+python3 tools/compare_reports.py build/horizon/Horizon-sqlite/public_html \
+    build/horizon/Horizon-rust/public_html
+```
+
+Omit `--generators` for the full skin. On the Pi, WeeWX and the extension were
+installed with pip and `weectl`; `--references` then points at a directory
+whose `json-source/src/weewx_data` links to the installed `weewx_data`.
 
 ## Complete JSON generation
 

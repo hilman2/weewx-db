@@ -204,6 +204,18 @@ def test_every_wind_vector_aggregate(daily_pair, monkeypatch, observation, aggre
     compare(actual, expected)
 
 
+@pytest.mark.parametrize('observation', ['windvec', 'outTemp'])
+def test_raw_series_over_whole_days(daily_pair, monkeypatch, observation):
+    # Whole days qualify for the daily summaries, which hold no archive records.
+    from weewxdb.batch import get_series_many
+    (baseline, native), full_span = daily_pair
+    span = weeutil.weeutil.TimeSpan(full_span.start + 86400, full_span.start + 3 * 86400)
+    monkeypatch.setattr(weewx.xtypes, 'xtypes', builtin_providers())
+    expected = weewx.xtypes.get_series(observation, span, baseline)
+    request = {'observation': observation, 'span': span, 'aggregate': None, 'interval': None}
+    compare(get_series_many([request], native)[0], expected)
+
+
 @pytest.fixture
 def xaggs(monkeypatch):
     path = pathlib.Path(__file__).resolve().parents[1] / 'build/weewx-db-trial/xaggs-source/bin/user/xaggs.py'

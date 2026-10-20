@@ -149,6 +149,80 @@ pub fn date_parts(time: i64, local: bool) -> Result<(i32,i32,i32,i32,f64)> {
     Ok((p.tm_year+1900,p.tm_mon+1,p.tm_mday,p.tm_yday,p.tm_hour as f64+p.tm_min as f64/60.0+p.tm_sec as f64/3600.0))
 }
 
+/// The intervals of `weeutil.weeutil.intervalgen()` for a fixed length in seconds.
+///
+/// Like WeeWX, this steps the local wall clock, not the timestamp, so that the
+/// boundaries stay on the same local time across a DST change. Each boundary goes
+/// through libc's `mktime` with an unknown DST flag, as Python's `time.mktime` does,
+/// so both agree on skipped and repeated local times.
+#[cfg(unix)]
+pub fn local_intervals(start: i64, stop: i64, interval: i64) -> Result<Vec<(i64,i64)>> {
+    ensure!(interval > 0, "interval must be positive");
+    // The local wall clock as seconds since 1970-01-01 00:00, as if every day had 86,400.
+    let wall = |time: i64| -> Result<i64> {
+        let timestamp = libc::time_t::try_from(time).context("timestamp outside platform range")?;
+        let mut parts = std::mem::MaybeUninit::<libc::tm>::uninit();
+        let ptr = unsafe { libc::localtime_r(&timestamp,parts.as_mut_ptr()) };
+        ensure!(!ptr.is_null(),"timestamp outside calendar range");
+        // localtime_r succeeded, so all tm fields are initialized.
+        let p = unsafe { parts.assume_init() };
+        let days = days_from_civil(p.tm_year as i64+1900,p.tm_mon as i64+1,p.tm_mday as i64);
+        Ok(days*86400+p.tm_hour as i64*3600+p.tm_min as i64*60+p.tm_sec as i64)
+    };
+    let stamp = |wall: i64| -> Result<i64> {
+        let (year,month,day) = civil_from_days(wall.div_euclid(86400));
+        let seconds = wall.rem_euclid(86400);
+        let mut parts: libc::tm = unsafe { std::mem::zeroed() };
+        parts.tm_year = (year-1900) as libc::c_int;
+        parts.tm_mon = (month-1) as libc::c_int;
+        parts.tm_mday = day as libc::c_int;
+        parts.tm_hour = (seconds/3600) as libc::c_int;
+        parts.tm_min = (seconds/60%60) as libc::c_int;
+        parts.tm_sec = (seconds%60) as libc::c_int;
+        parts.tm_isdst = -1;
+        Ok(unsafe { libc::mktime(&mut parts) } as i64)
+    };
+    let end = wall(stop)?;
+    let mut begin = wall(start)?;
+    let mut first = stamp(begin)?;
+    let mut previous = 0;
+    let mut result = Vec::new();
+    while begin < end {
+        let next = (begin+interval).min(end);
+        let second = stamp(next)?;
+        if second > first && first > previous {
+            result.push((first,second));
+            previous = first;
+        }
+        begin = next;
+        first = second;
+    }
+    Ok(result)
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year-1 } else { year };
+    let era = year.div_euclid(400);
+    let of_era = year-era*400;
+    let of_year = (153*(month+if month > 2 { -3 } else { 9 })+2)/5+day-1;
+    let of_cycle = of_era*365+of_era/4-of_era/100+of_year;
+    era*146097+of_cycle-719468
+}
+
+/// The proleptic Gregorian date of a number of days since 1970-01-01.
+fn civil_from_days(days: i64) -> (i64,i64,i64) {
+    let days = days+719468;
+    let era = days.div_euclid(146097);
+    let of_era = days-era*146097;
+    let of_cycle = (of_era-of_era/1460+of_era/36524-of_era/146096)/365;
+    let of_year = of_era-(365*of_cycle+of_cycle/4-of_cycle/100);
+    let shifted = (5*of_year+2)/153;
+    let day = of_year-(153*shifted+2)/5+1;
+    let month = if shifted < 10 { shifted+3 } else { shifted-9 };
+    (of_cycle+era*400+if month <= 2 { 1 } else { 0 },month,day)
+}
+
 pub fn evapotranspiration(args: &[f64;6], time: i64, units: i64, p: &Parameters) -> Option<f64> {
     let [tmin,tmax,hmin,hmax,radiation,wind] = *args;
     // ETXType converts through US units before calling the metric formula.

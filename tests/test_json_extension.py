@@ -117,13 +117,13 @@ def test_incremental_resume_calendar_is_reused(tmp_path, monkeypatch):
 
 
 def test_changed_generator_interface_delegates_to_installed_base(tmp_path, monkeypatch):
-    def future_archive(self, *args, **kwargs):
+    def future_line(self, *args, **kwargs):
         return 'future generator'
-    monkeypatch.setattr(base.JSONGenerator, '_archive_file', future_archive)
+    monkeypatch.setattr(base.JSONGenerator, '_aggregate_line', future_line)
     instance = generator({'driver': 'weedb.sqlite', 'database_name': str(tmp_path / 'unused.sdb')},
                          tmp_path, 1704067200, generator_class=JSONGenerator)
     try:
-        assert not instance._batch_supported
-        assert instance._archive_file() == 'future generator'
+        assert not instance._supported
+        assert instance._aggregate_line() == 'future generator'
     finally:
         instance.finalize()

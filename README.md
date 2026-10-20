@@ -6,9 +6,9 @@ aggregates and the solar/lunar almanac in Rust. It installs as one WeeWX
 extension and needs no compiler, no pip and no PyEphem on the station. Your
 SQLite archive stays on disk, and you can switch back at any time.
 
-The backend is experimental and has been measured on Linux x86_64 only. Read
-the [supported operations and limits](reference.md) before switching a station
-you rely on.
+The backend is experimental. It has been measured on Linux x86_64 and on a
+Raspberry Pi 4. Read the [supported operations and limits](reference.md) before
+switching a station you rely on.
 
 ## What you gain
 
@@ -19,8 +19,10 @@ record by record in Python. On a ten-year archive with five-minute records, a
 yearly hourly series of such an observation took 20 to 40 times less time than
 WeeWX on SQLite, and a mean over the whole archive took 250 to 700 times less.
 A JSON report rebuild that plots three calculated observations dropped from 24
-seconds to half a second. Reports on stored observations rebuild about twice
-as fast. Incremental updates of an existing report are as fast as before.
+seconds to half a second. The JSON files of WeeWX 5.6's Horizon skin, ten years
+of stored observations, rebuilt six times as fast as on SQLite; on a
+Raspberry Pi 4 in 33 instead of 220 seconds. Updating them after a new record
+takes as long as on SQLite.
 
 **Long-term statistics come from summaries, not scans.** Every stored block
 carries count, sum, minimum and maximum. Historical aggregates such as the mean
@@ -46,7 +48,8 @@ the whole process.
 
 **Classic skins render faster without changes.** Seasons, Belchertown,
 Neowx-Material and Weather Data Center regenerate their pages after each
-archive record 15 to 35 percent faster than on SQLite. Report runs reuse the
+archive record 15 to 35 percent faster than on SQLite; on a Raspberry Pi 4,
+Seasons took 6.3 instead of 9.5 seconds. Report runs reuse the
 index, journal and statistics of earlier runs for periods without new data.
 A complete first generation is 11 to 18 percent faster. Record queries such
 as the wettest or warmest day answer two to eight times faster than SQLite.
@@ -77,8 +80,9 @@ verify the download and describes what the installer writes. In short, it
 places the files under `bin/user/weewxdb` and adds a `weewx_rust` database
 entry to `weewx.conf`. Nothing else changes yet; WeeWX keeps running on SQLite.
 
-The extension does not include a JSON generator. Its JSON adapter extends the
-generator that ships with WeeWX 5.6. Everything else works on any WeeWX 5.
+The extension does not include a JSON generator. JSON reports use the one that
+ships with WeeWX 5.6 and read from the Rust database without changes.
+Everything else works on any WeeWX 5.
 
 ### 2. Stop WeeWX and import the archive
 
@@ -92,8 +96,8 @@ Import the archive into a new file next to it. The import reads a consistent
 SQLite transaction, including committed WAL data, and copies the daily
 summaries as they are, including LOOP extrema and time weights. The
 destination must not exist yet. A ten-year archive with a million
-five-minute records took about one second on a desktop; expect longer on a
-Raspberry Pi.
+five-minute records took about one second on a desktop and one minute on a
+Raspberry Pi 4 throttled to 600 MHz.
 
 ```sh
 ~/weewx-data/bin/user/weewxdb/weewx-db import \
@@ -167,14 +171,13 @@ SQLite. Only the bindings you point at `weewx_rust` move.
 
 Two more pieces are off by default because they replace WeeWX classes:
 
-- **JSON reports on WeeWX 5.6.** Swap the generator class in the report's
-  `skin.conf` so the generator fetches all series of a plot in one batch
-  from Rust. The driver alone already gives the rebuild gains above; batching
-  removes up to another half of the remaining time.
+- **Stored or calculated values in JSON reports on WeeWX 5.6.** Swap the
+  generator class in the report's `skin.conf` to choose per line whether a
+  value is read from its column or calculated. It is not needed for speed.
 - **Packet calculations.** Swap `StdWXCalculate` in `weewx.conf` so the
   values in LOOP packets are calculated by the same Rust formulas.
 
-The [extension guide](extension.md#enable-the-json-adapter) has the exact
+The [extension guide](extension.md#choose-stored-or-calculated-values-in-json-reports) has the exact
 lines to change for both.
 
 ### 6. If you want to go back

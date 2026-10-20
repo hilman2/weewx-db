@@ -19,6 +19,8 @@ import weewx.units
 import weewx.wxxtypes
 import weewx.xtypes
 
+from . import _weewxdb
+
 
 WEATHER_INPUTS = {
     'dewpoint': ['outTemp', 'outHumidity'], 'inDewpoint': ['inTemp', 'inHumidity'],
@@ -281,7 +283,8 @@ def threshold_value(options, manager):
     return weewx.units.convertStd((float(value[0]), value[1], value[2]), manager.std_unit_system)[0]
 
 
-def query_for(observation, span, aggregate, manager, options):
+def query_for(observation, span, aggregate, manager, options, raw=False):
+    # A raw series reads archive records, which the daily summaries do not hold.
     if getattr(manager.connection, 'native', None) is None:
         raise weewx.UnknownType(observation)
     start, stop = map(math.floor, span)
@@ -333,7 +336,8 @@ def query_for(observation, span, aggregate, manager, options):
     elif observation in ['windvec', 'windgustvec']:
         if not dispatch_allowed('get_aggregate', weewx.xtypes.WindVecDaily):
             raise weewx.UnknownAggregation(aggregate)
-        if observation == 'windvec' and aggregate in ['avg', 'not_null'] and eligible('wind', span, manager, aggregate):
+        if observation == 'windvec' and aggregate in ['avg', 'not_null'] and not raw \
+                and eligible('wind', span, manager, aggregate):
             query.update(mode='daily', observation='wind', aggregate='windvec_avg' if aggregate == 'avg' else aggregate,
                          table='%s_day_wind' % manager.table_name,
                          ranges=[[weeutil.weeutil.startOfDay(start), stop]])
@@ -341,7 +345,8 @@ def query_for(observation, span, aggregate, manager, options):
             query.update(mode='vector')
         else:
             raise weewx.UnknownAggregation(aggregate)
-    elif aggregate in weewx.xtypes.DailySummaries.agg_sql_dict and eligible(observation, span, manager, aggregate):
+    elif aggregate in weewx.xtypes.DailySummaries.agg_sql_dict and not raw \
+            and eligible(observation, span, manager, aggregate):
         if not dispatch_allowed('get_aggregate', weewx.xtypes.DailySummaries):
             raise weewx.UnknownAggregation(aggregate)
         query.update(mode='daily', table='%s_day_%s' % (manager.table_name, observation),
@@ -572,41 +577,61 @@ def finish_aggregate(observation, aggregate_type, manager, query, result):
     return weewx.units.ValueTuple(value, unit, group)
 
 
+def intervals(start, stop, interval):
+    """Return the (start, stop) of each span weeutil.weeutil.intervalgen() yields.
+
+    The engine lays out fixed intervals between whole seconds. Calendar months and
+    fractional seconds take WeeWX's own generator.
+    """
+    seconds = weeutil.weeutil.nominal_spans(interval)
+    local = getattr(_weewxdb, 'local_intervals', None)
+    if local is None or seconds == weeutil.weeutil.nominal_intervals['month'] \
+            or not all(float(value).is_integer() for value in (start, stop, seconds)):
+        return [(math.floor(span.start), math.floor(span.stop))
+                for span in weeutil.weeutil.intervalgen(start, stop, interval)]
+    return local(int(start), int(stop), int(seconds))
+
+
+def uses_daily(observation, span, manager, aggregate_type, aggregate_interval, options):
+    """Return whether a series takes its aggregates from the daily summaries."""
+    interval = weeutil.weeutil.nominal_spans(aggregate_interval) if aggregate_type else None
+    return options.get('source', 'auto') == 'auto' \
+        and aggregate_type in weewx.xtypes.DailySummaries.common \
+        and eligible(observation, span, manager, aggregate_type) \
+        and interval is not None and (interval % 86400 == 0 or interval in [
+            weeutil.weeutil.nominal_intervals['month'], weeutil.weeutil.nominal_intervals['year']])
+
+
 def prepare_series(observation, span, manager, aggregate_type=None, aggregate_interval=None, **options):
     """Plan a series using WeeWX calendar boundaries and dispatcher priority."""
     if getattr(manager.connection, 'native', None) is None:
         raise weewx.UnknownType(observation)
     interval = weeutil.weeutil.nominal_spans(aggregate_interval) if aggregate_type else None
-    use_daily = options.get('source', 'auto') == 'auto' \
-        and aggregate_type in weewx.xtypes.DailySummaries.common \
-        and eligible(observation, span, manager, aggregate_type) \
-        and interval is not None and (interval % 86400 == 0 or interval in [
-            weeutil.weeutil.nominal_intervals['month'], weeutil.weeutil.nominal_intervals['year']])
+    use_daily = uses_daily(observation, span, manager, aggregate_type, aggregate_interval, options)
     if not dispatch_allowed('get_series', weewx.xtypes.ArchiveTable):
         raise weewx.UnknownType(observation)
     start, stop = map(math.floor, span)
     ranges = []
     if aggregate_type is None:
-        query = query_for(observation, span, 'avg', manager, options)
+        query = query_for(observation, span, 'avg', manager, options, raw=True)
         query.update(raw=True)
     else:
         if aggregate_interval is None:
             raise weewx.UnknownAggregation(aggregate_interval)
         if use_daily:
             if interval == weeutil.weeutil.nominal_intervals['month']:
-                spans = weeutil.weeutil.genMonthSpans(start, stop)
+                spans = [(s.start, s.stop) for s in weeutil.weeutil.genMonthSpans(start, stop)]
             elif interval == weeutil.weeutil.nominal_intervals['year']:
-                spans = weeutil.weeutil.genYearSpans(start, stop)
+                spans = [(s.start, s.stop) for s in weeutil.weeutil.genYearSpans(start, stop)]
             else:
-                spans = weeutil.weeutil.intervalgen(weeutil.weeutil.startOfDay(start), stop, interval)
-            ranges = [(max(math.floor(s.start), start), min(math.floor(s.stop), stop)) for s in spans]
+                spans = intervals(weeutil.weeutil.startOfDay(start), stop, interval)
+            ranges = [(max(math.floor(a), start), min(math.floor(b), stop)) for a, b in spans]
             query = query_for(observation, span, aggregate_type, manager, options)
             query['ranges'] = ranges
         else:
-            ranges = [(math.floor(s.start), math.floor(s.stop))
-                      for s in weeutil.weeutil.intervalgen(start, stop, aggregate_interval)
-                      if manager.first_timestamp is not None and s.stop > manager.first_timestamp
-                      and manager.last_timestamp is not None and s.start < manager.last_timestamp]
+            ranges = [(a, b) for a, b in intervals(start, stop, aggregate_interval)
+                      if manager.first_timestamp is not None and b > manager.first_timestamp
+                      and manager.last_timestamp is not None and a < manager.last_timestamp]
             if not ranges:
                 query = {'mode': 'archive', 'observation': observation, 'aggregate': aggregate_type, 'ranges': []}
             else:
@@ -651,12 +676,15 @@ def finish_series(observation, aggregate_type, manager, plan, result):
 def series(observation, span, manager, aggregate_type=None, aggregate_interval=None, **options):
     provider = scalar_provider(observation) if observation not in manager.sqlkeys or options.get('source') in ['derived', 'fill_missing'] else None
     with provider_lock(provider) if provider is not None else contextlib.nullcontext():
-        plan = prepare_series(observation, span, manager, aggregate_type, aggregate_interval, **options)
         old_weather = observation in ['dewpoint', 'inDewpoint', 'humidex', 'heatindex']
         old_aggregate = aggregate_type in [None, 'sum', 'avg', 'count', 'min', 'max', 'cumulative']
+        # NativeXType.get_series() answers these. Decided before planning, which
+        # would otherwise lay out every aggregation interval for nothing.
         if options.get('source', 'auto') == 'auto' and old_aggregate \
-                and (old_weather or observation in manager.sqlkeys) and not plan[2]:
+                and (old_weather or observation in manager.sqlkeys) \
+                and not uses_daily(observation, span, manager, aggregate_type, aggregate_interval, options):
             raise weewx.UnknownType(observation)
+        plan = prepare_series(observation, span, manager, aggregate_type, aggregate_interval, **options)
         result = request(manager, plan[0])
         if provider is not None and plan[0]['mode'] == 'weather':
             apply_state(provider, observation, result['state'], manager)
