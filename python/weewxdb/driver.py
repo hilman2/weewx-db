@@ -187,6 +187,18 @@ class Cursor(weedb.Cursor):
         return self.cursor.rowcount
 
     @guard
+    def drop_columns(self, table, column_names):
+        """Drop each column in `column_names` from `table`, as weedb.sqlite does,
+        but without copying the table."""
+        self.cursor.execute('PRAGMA table_info(%s)' % _quote(table))
+        existing = {row[1] for row in self.cursor.fetchall()}
+        for column in column_names:
+            if column not in existing:
+                raise weedb.NoColumnError("Cannot DROP '%s'; column does not exist." % column)
+        for column in column_names:
+            self.cursor.execute('ALTER TABLE %s DROP COLUMN %s' % (_quote(table), _quote(column)))
+
+    @guard
     def fetchone(self):
         return self.cursor.fetchone()
 

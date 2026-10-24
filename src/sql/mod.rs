@@ -11,7 +11,7 @@ use std::ffi::{CStr, CString, c_int};
 use std::sync::{Mutex, MutexGuard};
 use std::cell::RefCell;
 use rusqlite::vtab::{self, VTab, CreateVTab, UpdateVTab, VTabCursor};
-use sqlparser::ast::{Statement, AlterTableOperation};
+use sqlparser::ast::{Statement, AlterTableOperation, RenameTableNameKind};
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
@@ -25,6 +25,14 @@ fn error(error: impl std::fmt::Display) -> rusqlite::Error {
 
 pub(crate) fn guard(shared: &Shared) -> rusqlite::Result<MutexGuard<'_, Store>> {
     shared.lock().map_err(|_| error("database mutex poisoned"))
+}
+
+/// Run a virtual-table callback, turning a panic into an SQLite error.
+/// rusqlite does not catch panics in these callbacks, and a panic that
+/// unwinds into SQLite's C code would abort the process.
+fn unwind<T>(callback: impl FnOnce() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
+        .unwrap_or_else(|panic| Err(error(format!("internal error: {}", crate::panic_message(&panic)))))
 }
 
 // SQLite requires its C base struct to be the first member of each virtual
@@ -42,7 +50,7 @@ unsafe impl<'vtab> VTab<'vtab> for ArchiveTable {
     type Aux = Shared;
     type Cursor = ArchiveCursor;
 
-    fn connect(db: &mut vtab::VTabConnection, aux: Option<&Shared>, _: &[u8], _: &[u8], table: &[u8], _: &[&[u8]]) -> rusqlite::Result<(Cow<'static, CStr>, Self)> {
+    fn connect(db: &mut vtab::VTabConnection, aux: Option<&Shared>, _: &[u8], _: &[u8], table: &[u8], _: &[&[u8]]) -> rusqlite::Result<(Cow<'static, CStr>, Self)> { unwind(|| {
         db.config(vtab::VTabConfig::ConstraintSupport)?;
         // This handle belongs to the connection that owns the virtual table.
         // It is used only during that connection's serialized write callbacks.
@@ -55,12 +63,12 @@ unsafe impl<'vtab> VTab<'vtab> for ArchiveTable {
             c.default.as_ref().map_or_else(String::new,|v| format!(" DEFAULT {}",v.json())))).collect::<Vec<_>>().join(","));
         let time_index = columns.iter().position(|c| c.name == "dateTime").unwrap();
         Ok((Cow::Owned(CString::new(definition).map_err(error)?), Self { base: Default::default(), store, table, time_index, connection }))
-    }
+    }) }
 
     /// The index string lists the constraints in argument order as
     /// `column:operator`, then `|` and the delivery order: empty for
     /// unordered, `asc` or `desc` by dateTime, or `top:column:descending`.
-    fn best_index(&self, info: &mut vtab::IndexInfo) -> rusqlite::Result<bool> {
+    fn best_index(&self, info: &mut vtab::IndexInfo) -> rusqlite::Result<bool> { unwind(|| {
         let mut plan = Vec::new();
         let mut argument = 0;
         // SQLite offers LIMIT only when every WHERE term is a constraint on
@@ -113,26 +121,26 @@ unsafe impl<'vtab> VTab<'vtab> for ArchiveTable {
         info.set_estimated_cost(if point { 1.0 } else if !plan.is_empty() { 100.0 } else { 1_000_000.0 });
         info.set_estimated_rows(if point { 1 } else { 10000 });
         Ok(true)
-    }
+    }) }
 
-    fn open(&mut self) -> rusqlite::Result<ArchiveCursor> {
+    fn open(&mut self) -> rusqlite::Result<ArchiveCursor> { unwind(|| {
         Ok(ArchiveCursor { base: Default::default(), store: self.store.clone(), table: self.table.clone(), cursor: RefCell::new(None), eof: true })
-    }
+    }) }
 }
 
 impl<'vtab> CreateVTab<'vtab> for ArchiveTable { const KIND: vtab::VTabKind = vtab::VTabKind::Default; }
 
 impl<'vtab> UpdateVTab<'vtab> for ArchiveTable {
-    fn delete(&mut self, value: ValueRef<'_>) -> rusqlite::Result<()> {
+    fn delete(&mut self, value: ValueRef<'_>) -> rusqlite::Result<()> { unwind(|| {
         let ValueRef::Integer(time) = value else { return Err(error("invalid rowid")); };
         guard(&self.store)?.delete(&self.table, time).map_err(error)
-    }
-    fn insert(&mut self, args: &vtab::Inserts<'_>) -> rusqlite::Result<i64> {
+    }) }
+    fn insert(&mut self, args: &vtab::Inserts<'_>) -> rusqlite::Result<i64> { unwind(|| {
         let values = args.iter().skip(2).map(Cell::read).collect::<Result<Vec<_>>>().map_err(error)?;
         let replace = unsafe { args.on_conflict(self.connection) } == vtab::ConflictMode::Replace;
         guard(&self.store)?.put(&self.table, values, replace).map_err(error)
-    }
-    fn update(&mut self, args: &vtab::Updates<'_>) -> rusqlite::Result<()> {
+    }) }
+    fn update(&mut self, args: &vtab::Updates<'_>) -> rusqlite::Result<()> { unwind(|| {
         let old: i64 = args.get(0)?;
         let values = args.iter().skip(2).map(Cell::read).collect::<Result<Vec<_>>>().map_err(error)?;
         let mut store = guard(&self.store)?;
@@ -145,7 +153,7 @@ impl<'vtab> UpdateVTab<'vtab> for ArchiveTable {
         }
         store.put(&self.table, values, true).map_err(error)?;
         Ok(())
-    }
+    }) }
 }
 
 fn ensure_sql(condition: bool, text: &str) -> rusqlite::Result<()> { if condition { Ok(()) } else { Err(error(text)) } }
@@ -160,7 +168,7 @@ struct ArchiveCursor {
 }
 
 unsafe impl VTabCursor for ArchiveCursor {
-    fn filter(&mut self, _: c_int, plan: Option<&str>, args: &vtab::Filters<'_>) -> rusqlite::Result<()> {
+    fn filter(&mut self, _: c_int, plan: Option<&str>, args: &vtab::Filters<'_>) -> rusqlite::Result<()> { unwind(|| {
         let mut lower = None;
         let mut upper = None;
         let mut store = guard(&self.store)?;
@@ -223,13 +231,13 @@ unsafe impl VTabCursor for ArchiveCursor {
         self.eof = !cursor.advance(&mut store).map_err(error)?;
         *self.cursor.get_mut() = Some(cursor);
         Ok(())
-    }
-    fn next(&mut self) -> rusqlite::Result<()> {
+    }) }
+    fn next(&mut self) -> rusqlite::Result<()> { unwind(|| {
         self.eof = !self.cursor.get_mut().as_mut().ok_or_else(|| error("uninitialized cursor"))?.advance(&mut *guard(&self.store)?).map_err(error)?;
         Ok(())
-    }
+    }) }
     fn eof(&self) -> bool { self.eof }
-    fn column(&self, ctx: &mut vtab::Context, index: c_int) -> rusqlite::Result<()> {
+    fn column(&self, ctx: &mut vtab::Context, index: c_int) -> rusqlite::Result<()> { unwind(|| {
         // SQLite's immutable callback still needs to cache projected columns.
         // Cursor-local interior mutability keeps the C layout and Rust aliases valid.
         let mut cursor = self.cursor.borrow_mut();
@@ -244,8 +252,8 @@ unsafe impl VTabCursor for ArchiveCursor {
             Cell::Null => ctx.set_result(&rusqlite::types::Null),
             other => ctx.set_result(&other.value()),
         }
-    }
-    fn rowid(&self) -> rusqlite::Result<i64> { Ok(self.cursor.borrow().as_ref().ok_or_else(|| error("uninitialized cursor"))?.time) }
+    }) }
+    fn rowid(&self) -> rusqlite::Result<i64> { unwind(|| { Ok(self.cursor.borrow().as_ref().ok_or_else(|| error("uninitialized cursor"))?.time) }) }
 }
 
 pub(crate) fn tighten_lower(bound: &mut Option<(i64,bool)>, time: i64, inclusive: bool) {
@@ -566,18 +574,36 @@ impl Session {
             Statement::AlterTable(alter) => {
                 let name = vtab::dequote(&alter.name.to_string()).into_owned();
                 ensure!(alter.operations.len() == 1, "one schema operation per statement is supported");
-                let AlterTableOperation::AddColumn { column_def, .. } = &alter.operations[0] else { bail!("supported schema operation is ADD COLUMN") };
                 let mut store = guard(&self.store)?;
                 let ti = store.table_index(&name)?;
+                // SQLite checks the operation against the current definition
+                // and writes the new CREATE TABLE text.
                 let temp = Connection::open_in_memory()?;
                 temp.execute_batch(&store.snapshot.manifest.tables[ti].sql)?;
                 temp.execute_batch(sql)?;
-                let columns = numeric_columns(&temp, &name)?;
-                let column = columns.into_iter().find(|c| c.name == column_def.name.value).context("new column missing")?;
-                let new_sql: String = temp.query_row("SELECT sql FROM sqlite_master WHERE name=?", [&name], |r| r.get(0))?;
-                store.add_column(&name, column, &new_sql)?;
+                let definition = |table: &str| -> rusqlite::Result<String> { temp.query_row("SELECT sql FROM sqlite_master WHERE name=?", [table], |r| r.get(0)) };
+                let mut recreated = name.clone();
+                match &alter.operations[0] {
+                    AlterTableOperation::AddColumn { column_def, .. } => {
+                        let columns = numeric_columns(&temp, &name)?;
+                        let column = columns.into_iter().find(|c| c.name == column_def.name.value).context("new column missing")?;
+                        store.add_column(&name, column, &definition(&name)?)?;
+                    }
+                    AlterTableOperation::RenameColumn { old_column_name, new_column_name } =>
+                        store.rename_column(&name, &old_column_name.value, &new_column_name.value, &definition(&name)?)?,
+                    AlterTableOperation::DropColumn { column_names, .. } => {
+                        ensure!(column_names.len() == 1, "DROP COLUMN takes one column");
+                        store.drop_column(&name, &column_names[0].value, &definition(&name)?)?;
+                    }
+                    AlterTableOperation::RenameTable { table_name } => {
+                        let (RenameTableNameKind::To(target) | RenameTableNameKind::As(target)) = table_name;
+                        recreated = vtab::dequote(&target.to_string()).into_owned();
+                        store.rename_table(&name, &recreated, &definition(&recreated)?)?;
+                    }
+                    _ => bail!("supported schema operations are ADD COLUMN, RENAME COLUMN, DROP COLUMN and RENAME TO"),
+                }
                 drop(store);
-                self.connection.execute_batch(&format!("DROP TABLE {}; CREATE VIRTUAL TABLE {} USING weewx", quote(&name), quote(&name)))?;
+                self.connection.execute_batch(&format!("DROP TABLE {}; CREATE VIRTUAL TABLE {} USING weewx", quote(&name), quote(&recreated)))?;
             }
             Statement::Drop { names, if_exists, .. } => {
                 for name in names {
