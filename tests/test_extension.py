@@ -99,3 +99,16 @@ def test_wrong_platform_fails_before_installing_files(tmp_path):
     specification.loader.exec_module(module)
     with pytest.raises(weecfg.extension.InstallError, match='build an archive on the target system'):
         module.loader()
+
+
+def test_old_weewx_fails_before_installing_files(tmp_path, monkeypatch):
+    archive = build_archive(tmp_path / 'dist')
+    with zipfile.ZipFile(archive) as bundle:
+        bundle.extractall(tmp_path / 'extracted')
+    installer = next((tmp_path / 'extracted').iterdir()) / 'install.py'
+    specification = importlib.util.spec_from_file_location('old_weewx', installer)
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    monkeypatch.setattr(weewx, '__version__', '5.1.0')
+    with pytest.raises(weecfg.extension.InstallError, match='needs WeeWX 5.2 or later'):
+        module.loader()

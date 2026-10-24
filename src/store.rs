@@ -185,13 +185,18 @@ impl Store {
     }
 
     pub fn open(path: &Path, cache_bytes: usize) -> Result<Self> {
+        Self::open_with_timeout(path, cache_bytes, Duration::from_secs(5))
+    }
+
+    /// Open, waiting at most `timeout` for a writer that holds the lock.
+    pub fn open_with_timeout(path: &Path, cache_bytes: usize, timeout: Duration) -> Result<Self> {
         ensure!(path.is_file(), "database does not exist: {}", path.display());
-        let guard = lock(path, false, Duration::from_secs(5))?;
+        let guard = lock(path, false, timeout)?;
         let snapshot = Database::open(path, cache_bytes)?;
         let lsn = snapshot.manifest.lsn;
         let mut store = Self { snapshot, path: path.to_owned(), changes: BTreeMap::new(),
             lsn, valid_wal_bytes: 0, writer: None, pending: vec![], pending_bytes: 0,
-            timeout: Duration::from_secs(5), stamp: [None, None], workspace_bytes: 32*1024*1024,
+            timeout, stamp: [None, None], workspace_bytes: 32*1024*1024,
             sync_mode:SyncMode::Always,pending_sync:None,last_relaxed:false,legacy_wal:false, aggregates: HashMap::new(),
             canonical: std::fs::canonicalize(path)? };
         store.replay()?;

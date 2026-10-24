@@ -309,7 +309,11 @@ const POOL_LIMIT: usize = 64;
 
 impl Session {
     pub fn open(path: &Path, cache_bytes: usize) -> Result<Self> {
-        let store = Arc::new(Mutex::new(Store::open(path, cache_bytes)?));
+        Self::open_with_timeout(path, cache_bytes, std::time::Duration::from_secs(5))
+    }
+
+    pub fn open_with_timeout(path: &Path, cache_bytes: usize, timeout: std::time::Duration) -> Result<Self> {
+        let store = Arc::new(Mutex::new(Store::open_with_timeout(path, cache_bytes, timeout)?));
         let connection = Self::frontend(&store)?;
         let schema = schema_signature(&*guard(&store)?);
         Ok(Self { connection, store, explicit: false, metadata_dirty: false, active_cursors:0,

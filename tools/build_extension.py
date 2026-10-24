@@ -106,7 +106,7 @@ def build(output: Path, compile_rust: bool = True, target: str | None = None,
         # Include the matching sources so an archive can be rebuilt on ARM or
         # another distribution without relying on a moving repository branch.
         source_root = root / 'source'
-        names = ['Cargo.toml', 'Cargo.lock', 'build.rs', 'pyproject.toml', 'requirements-test.txt',
+        names = ['Cargo.toml', 'Cargo.lock', '.cargo/config.toml', 'build.rs', 'pyproject.toml', 'requirements-test.txt', 'justfile',
                  'LICENSE', 'NOTICE.md', 'SOURCE_SNAPSHOT.json', 'references.json',
                  'README.md', 'extension.md', 'batch.md', 'astronomy.md', 'architecture.md', 'reference.md']
         source_files = [ROOT / name for name in names]

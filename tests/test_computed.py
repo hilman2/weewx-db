@@ -7,6 +7,7 @@ import pytest
 
 weewxdb = pytest.importorskip('weewxdb')
 
+import weeutil.weeutil
 import weewx
 import weewx.manager
 import weewx.units
@@ -61,7 +62,7 @@ def test_computed_xtypes_match_python_without_loading_records(tmp_path, monkeypa
     for manager in [baseline, native]:
         with manager.connection.cursor() as cursor:
             cursor.execute('UPDATE archive SET outHumidity=NULL WHERE dateTime=?', (start + 3000,))
-    span = (start, records[-1]['dateTime'])
+    span = weeutil.weeutil.TimeSpan(start, records[-1]['dateTime'])
 
     def forbid_record_loading(*args, **kwargs):
         raise AssertionError('Native XType fell back to Python record processing')
@@ -85,11 +86,11 @@ def test_computed_xtypes_match_python_without_loading_records(tmp_path, monkeypa
                 assert_value(actual[2], expected[2])
         # No archive rows occur in this span. XTypeTable's SUM is zero, with
         # unknown units. A span with NULL inputs still has known archive units.
-        empty = (span[1] + 300, span[1] + 600)
+        empty = weeutil.weeutil.TimeSpan(span[1] + 300, span[1] + 600)
         for aggregate in ['sum', 'avg', 'min', 'max', 'count']:
             assert_value(weewx.xtypes.get_aggregate('dewpoint', empty, aggregate, native),
                          weewx.xtypes.get_aggregate('dewpoint', empty, aggregate, baseline))
-        for selected in [empty, (start, start + 192 * 300)]:
+        for selected in [empty, weeutil.weeutil.TimeSpan(start, start + 192 * 300)]:
             for aggregate in [None, 'sum', 'avg', 'count']:
                 expected = weewx.xtypes.get_series('dewpoint', selected, baseline,
                                                   aggregate_type=aggregate, aggregate_interval=3600)
@@ -116,7 +117,7 @@ def test_custom_scalar_provider_and_stored_values_keep_precedence(tmp_path, monk
                 'outTemp': 30.0, 'outHumidity': 80.0}]
     baseline, native = managers(tmp_path, records)
     try:
-        assert weewx.xtypes.get_aggregate('dewpoint', (0, 300), 'avg', native)[0] == -123.0
+        assert weewx.xtypes.get_aggregate('dewpoint', weeutil.weeutil.TimeSpan(0, 300), 'avg', native)[0] == -123.0
         with native.connection.cursor() as cursor:
             cursor.execute('ALTER TABLE archive ADD COLUMN dewpoint REAL DEFAULT 42.0')
         native.sqlkeys = native.connection.columnsOf('archive')

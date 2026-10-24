@@ -11,25 +11,61 @@ from . import _weewxdb
 from .native import RESULT_GENERATION
 
 
+# weedb has DatabaseLockedError since WeeWX 5.5. Earlier releases have only
+# its base class, which weewxd also answers by restarting the engine.
+DatabaseLockedError = getattr(weedb, 'DatabaseLockedError', weedb.OperationalError)
+
+
+def weedb_error(error):
+    """Return the weedb exception for an error of this package or its Rust module.
+
+    weewxd restarts its engine after a weedb.OperationalError and exits after
+    anything that is not a weedb exception.
+    """
+    message = str(error)
+    if isinstance(error, IntegrityError):
+        return weedb.IntegrityError(message)
+    if isinstance(error, ProgrammingError):
+        return weedb.ProgrammingError(message)
+    if 'no such table' in message:
+        return weedb.NoTableError(message)
+    if 'no such column' in message:
+        return weedb.NoColumnError(message)
+    if 'database is locked' in message:
+        return DatabaseLockedError(message)
+    if 'Permission denied' in message:
+        return weedb.PermissionError(message)
+    return weedb.OperationalError(message)
+
+
 def guard(function):
     @functools.wraps(function)
     def guarded(*args, **kwargs):
         try:
             return function(*args, **kwargs)
-        except IntegrityError as error:
-            raise weedb.IntegrityError(error) from error
-        except ProgrammingError as error:
-            raise weedb.ProgrammingError(error) from error
-        except DatabaseError as error:
-            message = str(error)
-            if 'no such table' in message:
-                raise weedb.NoTableError(error) from error
-            if 'no such column' in message:
-                raise weedb.NoColumnError(error) from error
-            if 'database is locked' in message:
-                raise weedb.DatabaseLockedError(error) from error
-            raise weedb.OperationalError(error) from error
+        except (DatabaseError, _weewxdb.DatabaseError) as error:
+            raise weedb_error(error) from error
     return guarded
+
+
+class _Native:
+    """The Rust connection as the XType, batch and packet adapters call it.
+
+    Lock timeouts and operating-system errors raise weedb exceptions. Other
+    errors stay ValueError, because the adapters read some of them as
+    UnknownType or UnsupportedFeature.
+    """
+
+    def __init__(self, native):
+        self._native = native
+
+    def __getattr__(self, name):
+        attribute = getattr(self._native, name)
+        if callable(attribute):
+            attribute = guard(attribute)
+            # Later lookups find the wrapped method without __getattr__.
+            setattr(self, name, attribute)
+        return attribute
 
 
 def _path(database_name, SQLITE_ROOT):
@@ -44,7 +80,7 @@ def create(database_name='', SQLITE_ROOT='', **options):
     try:
         _weewxdb.create(path)
     except ValueError as error:
-        raise weedb.OperationalError(error) from error
+        raise weedb_error(error) from error
 
 
 def connect(database_name='', SQLITE_ROOT='', **options):
@@ -58,10 +94,11 @@ def drop(database_name='', SQLITE_ROOT='', **options):
     try:
         _weewxdb.drop_database(path)
     except ValueError as error:
-        raise weedb.OperationalError(error) from error
+        raise weedb_error(error) from error
 
 
 class Connection(weedb.Connection):
+    @guard
     def __init__(self, database_name='', SQLITE_ROOT='', **options):
         self.file_path = _path(database_name, SQLITE_ROOT)
         if not os.path.isfile(self.file_path):
@@ -71,7 +108,7 @@ class Connection(weedb.Connection):
                                      workspace_mib=int(options.get('workspace_mib', 32)),
                                      sync_mode=options.get('sync_mode', 'background'))
         super().__init__(connection, database_name, 'sqlite')
-        self.native = connection.native
+        self.native = _Native(connection.native)
         # Aggregate results kept per generation for this database; 0 disables.
         self.result_cache = int(options.get('result_cache', RESULT_GENERATION))
         from . import xtypes
@@ -127,7 +164,9 @@ class Connection(weedb.Connection):
             row = cursor.fetchone()
             return (name, row[0]) if row else None
 
-    get_group_by = staticmethod(weedb.sqlite.Connection.get_group_by)
+    # WeeWX 5.3 added get_group_by and calls it only from then on.
+    if hasattr(weedb.sqlite.Connection, 'get_group_by'):
+        get_group_by = staticmethod(weedb.sqlite.Connection.get_group_by)
 
 
 def _quote(name):

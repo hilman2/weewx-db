@@ -266,6 +266,8 @@ def _dispatch_allowed(method, target):
 
 
 def eligible(observation, span, manager, aggregate):
+    # Callers pass interval tuples. Released WeeWX reads timespan.start here.
+    span = weeutil.weeutil.TimeSpan(*span)
     try:
         weewx.xtypes.DailySummaries.check_eligibility(observation, span, manager, aggregate)
         return True

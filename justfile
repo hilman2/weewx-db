@@ -8,6 +8,10 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 export PYTHONHASHSEED := "0"
 
 python := ".venv/bin/python"
+# Released WeeWX from PyPI: the oldest supported and the newest release.
+oldest_weewx := "build/weewx-releases/5.2.0"
+latest_weewx := "build/weewx-releases/5.5.2"
+# Pinned git trees: a WeeWX fork and the branch with the 5.6 JSON generator.
 weewx_source := "build/weewx-db-trial/weewx-source/src"
 json_source := "build/weewx-db-trial/json-source/src"
 library := if os() == "macos" { "target/release/libweewx_db.dylib" } else { "target/release/libweewx_db.so" }
@@ -19,7 +23,15 @@ setup:
     python3 -m venv .venv
     {{python}} -m pip install -r requirements-test.txt
     python3 tools/fetch_references.py
+    just releases
     just build
+
+# Unpack the released WeeWX versions the tests run against.
+releases:
+    for version in 5.2.0 5.5.2; do \
+        test -d build/weewx-releases/$version || \
+            {{python}} -m pip install -q --no-deps --target build/weewx-releases/$version weewx==$version; \
+    done
 
 # Build the CLI and the Python module in one Cargo run, as the release packager does.
 build:
@@ -32,12 +44,12 @@ lint:
 test-rust:
     cargo nextest run --locked --tests --status-level fail --final-status-level fail
 
-# Run the Python suite against one WeeWX source tree.
-test-python source=weewx_source *args="tests":
+# Run the Python suite against one WeeWX tree.
+test-python source=latest_weewx *args="tests":
     PYTHONPATH=python:{{source}} {{python}} -m pytest -q --tb=short -n auto {{args}}
 
-# Lint, build and run every Rust and Python test against the pinned WeeWX.
-fast: lint build test-rust (test-python weewx_source)
+# Lint, build and run every Rust and Python test against the newest WeeWX release.
+fast: lint build test-rust (test-python latest_weewx)
 
 # Like fast, but runs only the Python tests affected by Python-only changes.
 affected:
@@ -49,8 +61,8 @@ affected:
     else
         just build
         # testmon cannot see changes inside the Rust module, hence the guard above.
-        PYTHONPATH=python:{{weewx_source}} {{python}} -m pytest -q --tb=short --testmon tests
+        PYTHONPATH=python:{{latest_weewx}} {{python}} -m pytest -q --tb=short --testmon tests
     fi
 
-# Everything, including the WeeWX 5.6 JSON generator tree.
-full: fast (test-python json_source)
+# Everything: also the oldest supported release, the fork and the 5.6 branch.
+full: fast (test-python oldest_weewx) (test-python weewx_source) (test-python json_source)

@@ -7,7 +7,28 @@ use pyo3::types::{PyBytes, PyInt, PyFloat, PyString, PyList, PyTuple, PyDict, Py
 use pyo3::exceptions::PyValueError;
 use crate::computed::Computed;
 
-fn py_error(error: impl std::fmt::Display) -> PyErr { PyValueError::new_err(error.to_string()) }
+pyo3::create_exception!(_weewxdb, DatabaseError, PyValueError, "The database could not be read or written: a lock timeout or an operating-system error.");
+
+/// The whole context chain becomes the message, so that the WeeWX log names
+/// the file and the cause. Failures with an operating-system cause, which
+/// includes lock timeouts, raise DatabaseError; the driver maps it to weedb's
+/// exceptions, after which weewxd restarts its engine instead of exiting.
+fn py_error(error: impl Into<anyhow::Error>) -> PyErr {
+    let error = error.into();
+    let message = format!("{error:#}");
+    if error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some()) {
+        DatabaseError::new_err(message)
+    } else {
+        PyValueError::new_err(message)
+    }
+}
+
+fn py_message(message: &str) -> PyErr { PyValueError::new_err(message.to_owned()) }
+
+/// Duration::from_secs_f64 panics on negative or non-finite input.
+fn ensure_timeout(seconds: f64) -> PyResult<()> {
+    if seconds.is_finite() && (0.0..=3600.0).contains(&seconds) { Ok(()) } else { Err(py_message("invalid lock timeout")) }
+}
 type AggregateResult = (u64,Option<f64>,Option<f64>,Option<f64>);
 type ComputationSpec = (String,(String,String),i64);
 type ComputedResult = (u64,u64,Option<f64>,Option<f64>,Option<f64>);
@@ -20,10 +41,11 @@ impl PyConnection {
     #[new]
     #[pyo3(signature=(path,cache_mib=32,timeout=5.0,workspace_mib=32,sync_mode="background"))]
     fn new(py: Python<'_>, path: String, cache_mib: usize, timeout: f64, workspace_mib: usize, sync_mode: &str) -> PyResult<Self> {
-        let cache = cache_mib.checked_mul(1024*1024).ok_or_else(||py_error("cache size overflow"))?;
-        let workspace = workspace_mib.checked_mul(1024*1024).ok_or_else(||py_error("workspace size overflow"))?;
+        let cache = cache_mib.checked_mul(1024*1024).ok_or_else(||py_message("cache size overflow"))?;
+        let workspace = workspace_mib.checked_mul(1024*1024).ok_or_else(||py_message("workspace size overflow"))?;
+        ensure_timeout(timeout)?;
         let session = py.detach(|| -> Result<_> {
-            let mut session = Session::open(Path::new(&path),cache)?;
+            let mut session = Session::open_with_timeout(Path::new(&path),cache,std::time::Duration::from_secs_f64(timeout))?;
             session.set_workspace(workspace)?;
             session.set_sync_mode(sync_mode.parse()?)?;
             crate::sql::guard(&session.store)?.set_timeout(timeout)?;
@@ -34,7 +56,7 @@ impl PyConnection {
 
     #[getter]
     fn in_transaction(&self) -> PyResult<bool> {
-        Ok(self.session.lock().map_err(|_|py_error("connection mutex poisoned"))?.in_transaction())
+        Ok(self.session.lock().map_err(|_|py_message("connection mutex poisoned"))?.in_transaction())
     }
 
     #[pyo3(signature=(sql,parameters=None))]
@@ -45,16 +67,16 @@ impl PyConnection {
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(||self.session.lock().map_err(|_|py_error("connection mutex poisoned"))?.close().map_err(py_error))
+        py.detach(||self.session.lock().map_err(|_|py_message("connection mutex poisoned"))?.close().map_err(py_error))
     }
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(||self.session.lock().map_err(|_|py_error("connection mutex poisoned"))?.flush().map_err(py_error))
+        py.detach(||self.session.lock().map_err(|_|py_message("connection mutex poisoned"))?.flush().map_err(py_error))
     }
 
     #[pyo3(signature=(rebuild=false))]
     fn checkpoint(&self, py: Python<'_>, rebuild: bool) -> PyResult<()> {
-        py.detach(||self.session.lock().map_err(|_|py_error("connection mutex poisoned"))?.checkpoint(rebuild).map_err(py_error))
+        py.detach(||self.session.lock().map_err(|_|py_message("connection mutex poisoned"))?.checkpoint(rebuild).map_err(py_error))
     }
 
     #[pyo3(signature=(table,column,start,stop,daily=false))]
@@ -244,12 +266,12 @@ struct PyCursor {
 #[pymethods]
 impl PyCursor {
     #[getter]
-    fn engine(&self) -> PyResult<String> { Ok(self.cursor.lock().map_err(|_|py_error("cursor mutex poisoned"))?.engine.clone()) }
+    fn engine(&self) -> PyResult<String> { Ok(self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.engine.clone()) }
 
     fn fetchall(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let list = PyList::empty(py);
         loop {
-            let rows = py.detach(||self.cursor.lock().map_err(|_|py_error("cursor mutex poisoned"))?.fetchmany(1024).map_err(py_error))?;
+            let rows = py.detach(||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.fetchmany(1024).map_err(py_error))?;
             if rows.is_empty() { break; }
             for row in rows {
                 let cells = row.iter().map(|v|to_python(py,v)).collect::<PyResult<Vec<_>>>()?;
@@ -261,7 +283,7 @@ impl PyCursor {
 
     #[pyo3(signature=(size=200))]
     fn fetchmany(&self, py: Python<'_>, size: usize) -> PyResult<Py<PyAny>> {
-        let rows = py.detach(||self.cursor.lock().map_err(|_|py_error("cursor mutex poisoned"))?.fetchmany(size).map_err(py_error))?;
+        let rows = py.detach(||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.fetchmany(size).map_err(py_error))?;
         let list = PyList::empty(py);
         for row in rows {
             let cells = row.iter().map(|v|to_python(py,v)).collect::<PyResult<Vec<_>>>()?;
@@ -271,14 +293,14 @@ impl PyCursor {
     }
 
     fn fetchone(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        let rows = py.detach(||self.cursor.lock().map_err(|_|py_error("cursor mutex poisoned"))?.fetchmany(1).map_err(py_error))?;
+        let rows = py.detach(||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.fetchmany(1).map_err(py_error))?;
         rows.first().map(|row| {
             let cells = row.iter().map(|v|to_python(py,v)).collect::<PyResult<Vec<_>>>()?;
             Ok(PyTuple::new(py,cells)?.into_any().unbind())
         }).transpose()
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> { py.detach(||self.cursor.lock().map_err(|_|py_error("cursor mutex poisoned"))?.close().map_err(py_error)) }
+    fn close(&self, py: Python<'_>) -> PyResult<()> { py.detach(||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.close().map_err(py_error)) }
 }
 
 fn from_python(value: &Bound<'_,PyAny>) -> PyResult<Cell> {
@@ -287,7 +309,7 @@ fn from_python(value: &Bound<'_,PyAny>) -> PyResult<Cell> {
         else if value.is_instance_of::<PyFloat>() { Cell::Real(value.extract::<f64>()?.to_bits()) }
         else if value.is_instance_of::<PyString>() { Cell::Text(value.extract()?) }
         else if value.is_instance_of::<PyBytes>() { Cell::Blob(value.extract()?) }
-        else { return Err(py_error("SQL parameters must be int, float, str, bytes or None")); })
+        else { return Err(py_message("SQL parameters must be int, float, str, bytes or None")); })
 }
 
 fn to_python(py: Python<'_>, value: &Cell) -> PyResult<Py<PyAny>> {
@@ -314,12 +336,12 @@ fn answer_python(py: Python<'_>, answer: &crate::analytics::Answer) -> PyResult<
 
 fn python_json(value: &Bound<'_,PyAny>, depth: usize) -> PyResult<serde_json::Value> {
     use serde_json::Value as J;
-    if depth > 32 { return Err(py_error("native request nesting exceeded")); }
+    if depth > 32 { return Err(py_message("native request nesting exceeded")); }
     Ok(if value.is_none() { J::Null }
         else if value.is_instance_of::<PyBool>() { J::Bool(value.extract()?) }
         else if value.is_instance_of::<PyInt>() { J::from(value.extract::<i64>()?) }
         else if value.is_instance_of::<PyFloat>() {
-            J::Number(serde_json::Number::from_f64(value.extract()?).ok_or_else(||py_error("non-finite request number"))?)
+            J::Number(serde_json::Number::from_f64(value.extract()?).ok_or_else(||py_message("non-finite request number"))?)
         } else if value.is_instance_of::<PyString>() { J::String(value.extract()?) }
         else if let Ok(dict) = value.cast::<PyDict>() {
             let mut result = serde_json::Map::new();
@@ -327,7 +349,7 @@ fn python_json(value: &Bound<'_,PyAny>, depth: usize) -> PyResult<serde_json::Va
             J::Object(result)
         } else if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
             J::Array(value.try_iter()?.map(|v|python_json(&v?,depth+1)).collect::<PyResult<_>>()?)
-        } else { return Err(py_error("unsupported native request value")); })
+        } else { return Err(py_message("unsupported native request value")); })
 }
 
 fn json_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
@@ -379,6 +401,7 @@ fn local_intervals(py: Python<'_>, start: i64, stop: i64, interval: i64) -> PyRe
 
 #[pymodule]
 fn _weewxdb(module: &Bound<'_,PyModule>) -> PyResult<()> {
+    module.add("DatabaseError", module.py().get_type::<DatabaseError>())?;
     module.add_class::<PyConnection>()?;
     module.add_class::<PyCursor>()?;
     module.add_function(wrap_pyfunction!(create,module)?)?;
