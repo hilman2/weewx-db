@@ -404,7 +404,7 @@ impl Session {
         functions::register(&connection,guard(shared)?.workspace_bytes)?;
         connection.execute_batch("PRAGMA temp_store=FILE")?;
         let manifest = guard(shared)?.snapshot.manifest.clone();
-        for table in &manifest.tables {
+        for table in manifest.tables.iter() {
             connection.execute_batch(&format!("CREATE VIRTUAL TABLE {} USING weewx", quote(&table.name)))?;
         }
         for table in &manifest.metadata {
@@ -725,7 +725,7 @@ fn schema_signature(store: &Store) -> (u64, u64) {
     let mut rows = std::collections::hash_map::DefaultHasher::new();
     let manifest = &store.snapshot.manifest;
     manifest.id.hash(&mut structure);
-    for table in &manifest.tables { table.name.hash(&mut structure); table.sql.hash(&mut structure); table.columns.len().hash(&mut structure); }
+    for table in manifest.tables.iter() { table.name.hash(&mut structure); table.sql.hash(&mut structure); table.columns.len().hash(&mut structure); }
     for table in &manifest.metadata {
         table.name.hash(&mut structure); table.sql.hash(&mut structure);
         serde_json::to_vec(&table.rows).unwrap_or_default().hash(&mut rows);

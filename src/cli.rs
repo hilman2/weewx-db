@@ -38,12 +38,14 @@ pub enum Action {
     },
     /// Process JSONL {sql,params} requests in one persistent session.
     Batch { database: PathBuf, #[arg(long,default_value_t=32)] cache_mib: usize, #[arg(long,default_value_t=32)] workspace_mib: usize },
-    /// Merge the journal into affected blocks and publish a new index.
+    /// Fold changed rows into blocks now; --optimize also recomputes block summaries.
     Checkpoint { database: PathBuf, #[arg(long)] optimize: bool },
-    /// Reclaim obsolete blocks and checkpoint indices.
+    /// Delete replaced blocks and rebuild the file without free pages.
     Vacuum { database: PathBuf },
-    /// Verify the journal, index, and every referenced data block checksum.
+    /// Verify the file structure, every block checksum, timestamps and summaries.
     Check { database: PathBuf },
+    /// Write a consistent copy to a new file, also while WeeWX writes.
+    Backup { database: PathBuf, destination: PathBuf },
     /// Display SQL's time-index and column-index query plan.
     Explain { database: PathBuf, sql: String },
 }
@@ -145,7 +147,8 @@ pub fn run(action: Action) -> Result<()> {
         }
         Action::Checkpoint { database,optimize } => Store::open(&database,1024*1024)?.checkpoint(optimize)?,
         Action::Vacuum { database } => Store::open(&database,1024*1024)?.vacuum()?,
-        Action::Check { database } => { Store::open(&database,0)?.verify()?; println!("ok"); }
+        Action::Check { database } => { Store::open_read_only(&database,0)?.verify()?; println!("ok"); }
+        Action::Backup { database,destination } => Store::open_read_only(&database,0)?.backup(&destination)?,
         Action::Explain { database,sql } => {
             let mut session = Session::open(&database,1024*1024)?;
             println!("{}",session.execute(&format!("EXPLAIN QUERY PLAN {sql}"),&[])?.json());

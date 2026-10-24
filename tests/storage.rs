@@ -290,18 +290,13 @@ fn rejects_truncated_or_corrupt_files_and_never_overwrites() {
     assert!(import_sqlite(&sqlite, &own, "archive").is_err());
     assert_eq!(original, fs::read(&own).unwrap());
     let bad = dir.path().join("bad.wwdb");
-    for length in [0, 10, original.len() - 1] {
+    for length in [0, 10, 100] {
         fs::write(&bad, &original[..length]).unwrap();
         assert!(Database::open(&bad, 0).is_err());
     }
-    let mut corrupt = original.clone();
-    let last = corrupt.len() - 1;
-    corrupt[last] ^= 1;
-    fs::write(&bad, &corrupt).unwrap();
-    assert!(Database::open(&bad, 0).is_err());
-    corrupt = original;
-    corrupt[28] ^= 1;
-    fs::write(&bad, corrupt).unwrap();
+    fs::write(&bad, &original).unwrap();
+    // Damage every stored column payload behind SQLite's back.
+    Connection::open(&bad).unwrap().execute_batch("UPDATE chunks SET payload = zeroblob(length(payload))").unwrap();
     let mut db = Database::open(&bad, 0).unwrap();
     let error = db
         .aggregate(
@@ -315,6 +310,7 @@ fn rejects_truncated_or_corrupt_files_and_never_overwrites() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("checksum"), "{error}");
+    assert!(weewx_db::store::Store::open(&bad, 0).unwrap().verify().is_err());
     assert!(
         Database::open(&own, 0)
             .unwrap()

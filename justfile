@@ -64,5 +64,9 @@ affected:
         PYTHONPATH=python:{{latest_weewx}} {{python}} -m pytest -q --tb=short --testmon tests
     fi
 
-# Everything: also the oldest supported release, the fork and the 5.6 branch.
-full: fast (test-python oldest_weewx) (test-python weewx_source) (test-python json_source)
+# Two months of weewxd records on the WeeWX schema and 60 rounds of killed writers.
+test-long:
+    WEEWXDB_LONG_TESTS=1 PYTHONPATH=python:{{latest_weewx}} {{python}} -m pytest -q --tb=short -n 2 tests/test_long_run.py tests/test_crash.py
+
+# Everything: the long runs, the oldest supported release, the fork and the 5.6 branch.
+full: fast test-long (test-python oldest_weewx) (test-python weewx_source) (test-python json_source)

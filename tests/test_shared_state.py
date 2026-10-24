@@ -1,4 +1,4 @@
-"""Connections of one process share parsed indices and replayed journals."""
+"""Connections of one process share parsed indices and changed rows."""
 
 import pytest
 
@@ -37,8 +37,9 @@ def test_new_connections_see_every_published_frame_and_nothing_else(tmp_path):
     writer.execute('INSERT INTO archive VALUES (1200, 4.0, 9.0)').close()
     assert rows(path) == [(300, 1.5), (600, 2.0), (1200, 4.0)]
     writer.native.checkpoint()
-    # The new journal grows past the length the old journal had been read
-    # to, so only its identity tells the two apart.
+    # After a compaction, the rows changed later have transaction numbers
+    # above those the shared state had read; the new generation tells the
+    # two apart.
     later = [(1500 + 300 * i, float(i)) for i in range(40)]
     for time, value in later:
         writer.execute('INSERT INTO archive VALUES (?, ?, NULL)', (time, value)).close()

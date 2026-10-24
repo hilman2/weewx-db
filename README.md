@@ -50,7 +50,7 @@ the whole process.
 Neowx-Material and Weather Data Center regenerate their pages after each
 archive record 15 to 35 percent faster than on SQLite; on a Raspberry Pi 4,
 Seasons took 6.3 instead of 9.5 seconds. Report runs reuse the
-index, journal and statistics of earlier runs for periods without new data.
+index, changed rows and statistics of earlier runs for periods without new data.
 A complete first generation is 11 to 18 percent faster. Record queries such
 as the wettest or warmest day answer two to eight times faster than SQLite.
 
@@ -72,7 +72,7 @@ Download the ZIP for your machine from the
 `weectl`:
 
 ```sh
-weectl extension install weewx-db-0.2.0-aarch64-unknown-linux-gnu.zip
+weectl extension install weewx-db-0.3.0-aarch64-unknown-linux-gnu.zip
 ```
 
 The [extension guide](extension.md) lists the ZIP for each system, shows how to
@@ -124,7 +124,7 @@ binding as they are.
         database_name = weewx.wwdb
         cache_mib = 32
         workspace_mib = 32
-        sync_mode = background
+        sync_mode = always
 
 [DataBindings]
     [[wx_binding]]
@@ -139,10 +139,8 @@ memory budgets at their defaults for the first run; the
 [memory options](reference.md#memory-and-synchronization) describe what each
 one covers.
 
-With `sync_mode = background`, a commit is acknowledged after its journal
-entry is written and synchronized by a worker. After a power failure at most
-the newest archive record can be lost. Set `always` if you prefer each record
-to be synchronized before WeeWX continues.
+With `sync_mode = always`, every archive record is on disk before WeeWX
+continues, so a power failure loses nothing WeeWX has stored.
 
 ### 4. Start WeeWX and check the reports
 
@@ -197,21 +195,22 @@ use that one instead:
 
 ## Keep it running
 
-The database writes changes to a journal and folds them into the main file
-when the journal reaches 8 MiB, so no scheduled maintenance is needed. These
-commands help when you want to look:
+The database folds new records into its compressed blocks every few days and
+reuses the space of the blocks it replaced, so the file grows with your data
+and needs no scheduled maintenance. These commands help when you want to look:
 
 ```sh
-weewx-db check weewx.wwdb              # verify checksums and structure
-weewx-db info weewx.wwdb               # schema, row count, bounds, cache use
-weewx-db checkpoint weewx.wwdb --optimize   # fold the journal now
-weewx-db vacuum weewx.wwdb             # reclaim space after deletes
+weewx-db info weewx.wwdb               # schema, rows, bounds, blocks, file size
+weewx-db check weewx.wwdb              # verify the file, every block and summary
+weewx-db backup weewx.wwdb copy.wwdb   # consistent copy, also while WeeWX runs
+weewx-db vacuum weewx.wwdb             # shrink the file after large deletes
 ```
 
 `weewx-db` stands for `bin/user/weewxdb/weewx-db` under your WeeWX root. For
-backups, either export to SQLite as above or stop WeeWX and copy the `.wwdb`
-file together with its `.wal`, `.head` and `.lock` sidecars. The
-[storage explanation](architecture.md) describes the journal, checkpoints and
+backups, use `weewx-db backup` or export to SQLite as above. If you copy the
+file with other tools, stop WeeWX first and copy `weewx.wwdb` together with a
+`weewx.wwdb-wal` file if there is one. The
+[storage explanation](architecture.md) describes the file, compactions and
 backup rules in detail.
 
 ## Query the database

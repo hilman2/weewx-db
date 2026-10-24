@@ -49,7 +49,9 @@ def _call(function, *args, **kwargs):
         return function(*args, **kwargs)
     except ValueError as error:
         message = str(error)
-        if 'constraint failed' in message:
+        # As in SQLite, a value that does not fit a column is an integrity
+        # error. WeeWX then skips that record and keeps the others.
+        if 'constraint failed' in message or 'datatype mismatch' in message:
             raise IntegrityError(message) from error
         if any(text in message for text in [
                 'closed', 'number of SQL bindings', 'transaction already active',
@@ -58,13 +60,13 @@ def _call(function, *args, **kwargs):
         raise OperationalError(message) from error
 
 
-def connect(database, timeout=5.0, cache_mib=32, autocommit=True, workspace_mib=32, sync_mode='background'):
+def connect(database, timeout=5.0, cache_mib=32, autocommit=True, workspace_mib=32, sync_mode='always'):
     return Connection(database, timeout=timeout, cache_mib=cache_mib,
                       autocommit=autocommit, workspace_mib=workspace_mib, sync_mode=sync_mode)
 
 
 class Connection:
-    def __init__(self, database, timeout=5.0, cache_mib=32, autocommit=True, workspace_mib=32, sync_mode='background'):
+    def __init__(self, database, timeout=5.0, cache_mib=32, autocommit=True, workspace_mib=32, sync_mode='always'):
         self.native = _call(_weewxdb.Connection, str(database), cache_mib, timeout, workspace_mib, sync_mode)
         self.autocommit = autocommit
         self._in_transaction = False
