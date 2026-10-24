@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 use weewx_db::{Database, Span};
 
 #[derive(Parser)]
-#[command(about = "Experimental WeeWX column store and SQLite comparison")]
+#[command(version, about = "WeeWX column store, SQL and SQLite comparison")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -97,10 +97,10 @@ fn run() -> Result<()> {
         Command::Export {
             source,
             destination,
-        } => weewx_db::store::Store::open(&source, 0)?.export_sqlite(&destination)?,
+        } => weewx_db::store::Store::open_read_only(&source, 0)?.export_sqlite(&destination)?,
         Command::Info { database } => println!(
             "{}",
-            serde_json::to_string_pretty(&weewx_db::store::Store::open(&database, 0)?.info()?)?
+            serde_json::to_string_pretty(&weewx_db::store::Store::open_read_only(&database, 0)?.info()?)?
         ),
         Command::Query {
             database,

@@ -39,7 +39,7 @@ struct PyConnection { session: Arc<Mutex<Session>> }
 #[pymethods]
 impl PyConnection {
     #[new]
-    #[pyo3(signature=(path,cache_mib=32,timeout=5.0,workspace_mib=32,sync_mode="background"))]
+    #[pyo3(signature=(path,cache_mib=32,timeout=5.0,workspace_mib=32,sync_mode="always"))]
     fn new(py: Python<'_>, path: String, cache_mib: usize, timeout: f64, workspace_mib: usize, sync_mode: &str) -> PyResult<Self> {
         let cache = cache_mib.checked_mul(1024*1024).ok_or_else(||py_message("cache size overflow"))?;
         let workspace = workspace_mib.checked_mul(1024*1024).ok_or_else(||py_message("workspace size overflow"))?;

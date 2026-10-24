@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,6 +12,7 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde::{Deserialize, Serialize};
 
 pub mod store;
+pub mod container;
 mod changes;
 pub mod computed;
 pub mod weather;
@@ -23,10 +24,7 @@ pub mod sql;
 #[cfg(feature = "python")]
 mod python;
 
-const MAGIC: &[u8; 8] = b"WWXDB002";
-const HEADER_BYTES: u64 = 28;
 const BLOCK_ROWS: usize = 4096;
-const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum Kind {
@@ -64,18 +62,18 @@ pub(crate) fn numeric_cell(kind: Kind, cell: Cell) -> Cell {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// One column of one block. `chunk` names its payload in the file; zero
+/// means the column is NULL in every row and has no payload.
+#[derive(Clone, Debug, PartialEq)]
 struct ColumnBlock {
-    offset: u64,
+    chunk: u64,
     length: usize,
     checksum: u32,
-    #[serde(default)]
     stats: Option<Stats>,
-    #[serde(default)]
     compressed: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 struct Block {
     rows: usize,
     first: i64,
@@ -83,8 +81,10 @@ struct Block {
     columns: Vec<ColumnBlock>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 struct Table {
+    /// Never reused in a file, unlike the name.
+    ordinal: u64,
     name: String,
     sql: String,
     columns: Vec<Column>,
@@ -160,15 +160,19 @@ struct MetadataTable {
     rows: Vec<Vec<Cell>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Schemas and the block index of one snapshot. The tables are shared
+/// between connections and only copied when a schema changes.
+#[derive(Clone, Debug)]
 struct Manifest {
     archive: String,
-    tables: Vec<Table>,
+    tables: Arc<Vec<Table>>,
     metadata: Vec<MetadataTable>,
-    #[serde(default)]
+    /// The database's identity, fixed at creation.
     id: String,
-    #[serde(default)]
+    /// The last transaction this snapshot includes.
     lsn: u64,
+    /// The block index and schemas, which a compaction or schema change replace.
+    generation: u64,
 }
 
 /// SQL aggregate semantics: an empty or all-NULL input has a NULL sum.
@@ -205,14 +209,17 @@ impl Accumulator {
         if let Some(value) = value {
             self.stats.count += 1;
             // Compensate rounding when temperatures or other signed readings
-            // cancel. A plain sum loses 1.0 in [1e16, 1.0, -1e16].
+            // cancel. A plain sum loses 1.0 in [1e16, 1.0, -1e16]. An infinite
+            // reading makes the sum infinite, and its correction would be NaN.
             let previous = self.stats.sum.unwrap_or(0.0);
             let sum = previous + value;
-            self.correction += if previous.abs() >= value.abs() {
-                (previous - sum) + value
-            } else {
-                (value - sum) + previous
-            };
+            if sum.is_finite() {
+                self.correction += if previous.abs() >= value.abs() {
+                    (previous - sum) + value
+                } else {
+                    (value - sum) + previous
+                };
+            }
             self.stats.sum = Some(sum);
             self.stats.min = Some(self.stats.min.map_or(value, |n| n.min(value)));
             self.stats.max = Some(self.stats.max.map_or(value, |n| n.max(value)));
@@ -220,7 +227,8 @@ impl Accumulator {
     }
 
     fn finish(mut self) -> Stats {
-        self.stats.sum = self.stats.sum.map(|sum| sum + self.correction);
+        // As in SQLite, +inf and -inf together sum to NULL.
+        self.stats.sum = self.stats.sum.map(|sum| if sum.is_finite() { sum + self.correction } else { sum }).filter(|sum| !sum.is_nan());
         self.stats
     }
 }
@@ -260,6 +268,8 @@ pub struct Info {
     pub tables: Vec<String>,
     pub columns: Vec<String>,
     pub metadata_tables: Vec<String>,
+    /// Rows and blocks of each numeric table, without uncompacted changes.
+    pub blocks: std::collections::BTreeMap<String, (u64, usize)>,
     pub cache_bytes: usize,
     pub cache_limit_bytes: usize,
     pub reads: ReadMetrics,
@@ -275,30 +285,30 @@ pub struct ReadMetrics {
 
 /// The cache limit covers column payloads, not the index, results or OS cache.
 pub struct Database {
-    file: File,
+    container: container::Container,
     manifest: Arc<Manifest>,
     cache: Arc<std::sync::Mutex<BlockCache>>,
     cache_limit: usize,
     metrics: ReadMetrics,
 }
 
-/// Decoded column blocks by file offset, oldest first out.
-struct BlockCache { blocks: HashMap<u64, Arc<[u8]>>, order: VecDeque<u64>, bytes: usize, limit: usize }
+/// Decoded column payloads by chunk id with the CRC of their stored bytes,
+/// oldest first out. A chunk id names fixed content, except where a rolled
+/// back transaction had allocated it before; the CRC tells those apart.
+struct BlockCache { blocks: HashMap<u64, (u32, Arc<[u8]>)>, order: VecDeque<u64>, bytes: usize, limit: usize }
 
-/// Parsed manifests and decoded blocks of one database file, shared by every
-/// connection of this process. WeeWX opens new connections for each report,
-/// which then start with a parsed index and warm blocks. A block never
-/// changes at its offset: the file only grows, and vacuum writes a new file
-/// with a new inode, which gets its own entry.
-struct SharedFile { manifests: Vec<((u64, u64, u32), Arc<Manifest>)>, cache: Arc<std::sync::Mutex<BlockCache>> }
+/// Indices and decoded blocks of one database, shared by every connection of
+/// this process. WeeWX opens new connections for each report, which then
+/// start with a parsed index and warm blocks. Only committed state is shared.
+struct SharedFile { id: String, indices: Vec<(u64, Arc<Vec<Table>>)>, cache: Arc<std::sync::Mutex<BlockCache>> }
 
-fn shared_files() -> &'static std::sync::Mutex<HashMap<(std::path::PathBuf, u64), SharedFile>> {
-    static FILES: std::sync::OnceLock<std::sync::Mutex<HashMap<(std::path::PathBuf, u64), SharedFile>>> = std::sync::OnceLock::new();
+fn shared_files() -> &'static std::sync::Mutex<HashMap<std::path::PathBuf, SharedFile>> {
+    static FILES: std::sync::OnceLock<std::sync::Mutex<HashMap<std::path::PathBuf, SharedFile>>> = std::sync::OnceLock::new();
     FILES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// Manifests kept per file: the base index and recent checkpoints.
-const SHARED_MANIFESTS: usize = 4;
+/// Indices kept per database: the current and the previous generation.
+const SHARED_INDICES: usize = 2;
 
 pub fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -312,16 +322,16 @@ pub fn open_sqlite(path: &Path, cache_bytes: usize) -> Result<Connection> {
 }
 
 fn column_kind(declared: &str) -> Result<Kind> {
+    // SQLite's affinity rules: INT means INTEGER; REAL, FLOA and DOUB mean
+    // REAL. NUMERIC, DECIMAL, BOOLEAN and undeclared types hold numbers in a
+    // WeeWX archive and are stored as REAL. Text columns cannot be stored.
     let declared = declared.to_ascii_uppercase();
     if declared.contains("INT") {
         Ok(Kind::Integer)
-    } else if ["REAL", "FLOA", "DOUB"]
-        .iter()
-        .any(|s| declared.contains(s))
-    {
-        Ok(Kind::Real)
+    } else if ["CHAR", "CLOB", "TEXT", "BLOB"].iter().any(|s| declared.contains(s)) {
+        bail!("unsupported column type {declared:?}; only numeric columns can be stored")
     } else {
-        bail!("unsupported numeric column type {declared:?}")
+        Ok(Kind::Real)
     }
 }
 
@@ -331,11 +341,28 @@ fn block_bytes(rows: usize) -> usize {
 
 fn rows_per_block(table: &str) -> usize { if table.contains("_day_") { 128 } else { BLOCK_ROWS } }
 
-fn encode(values: &[Option<u64>]) -> Vec<u8> {
-    if values.iter().all(Option::is_none) {
-        return Vec::new();
+/// The stored payload of one column of a block: a NULL bitmap, eight bytes
+/// per row and, for an INTEGER column holding REAL values as SQLite allows, a
+/// bitmap of the REAL rows. An all-NULL column has no payload.
+fn encode_cells(kind: Kind, cells: &[&Cell]) -> Result<Vec<u8>> {
+    if cells.iter().all(|c| matches!(c, Cell::Null)) { return Ok(Vec::new()); }
+    let rows = cells.len();
+    let bitmap_bytes = rows.div_ceil(8);
+    let mixed = kind == Kind::Integer && cells.iter().any(|c| matches!(c, Cell::Real(_)));
+    let mut bytes = vec![0; block_bytes(rows) + if mixed { bitmap_bytes } else { 0 }];
+    for (i, cell) in cells.iter().enumerate() {
+        let value = match (kind, cell) {
+            (_, Cell::Null) => continue,
+            (Kind::Integer, Cell::Integer(n)) => *n as u64,
+            (Kind::Real, Cell::Real(bits)) => *bits,
+            (Kind::Integer, Cell::Real(bits)) => { bytes[block_bytes(rows) + i / 8] |= 1 << (i % 8); *bits }
+            (Kind::Real, Cell::Integer(n)) => (*n as f64).to_bits(),
+            _ => bail!("text or blob in a numeric column"),
+        };
+        bytes[i / 8] |= 1 << (i % 8);
+        bytes[bitmap_bytes + i * 8..bitmap_bytes + (i + 1) * 8].copy_from_slice(&value.to_le_bytes());
     }
-    encode_full(values)
+    Ok(bytes)
 }
 
 fn encode_full(values: &[Option<u64>]) -> Vec<u8> {
@@ -351,11 +378,24 @@ fn encode_full(values: &[Option<u64>]) -> Vec<u8> {
     bytes
 }
 
-fn stored_column(values: &[Option<u64>]) -> (Vec<u8>,bool) {
-    let raw = encode(values);
+fn stored_column(raw: Vec<u8>) -> (Vec<u8>,bool) {
     if raw.is_empty() { return (raw,false); }
     let compressed = lz4_flex::block::compress(&raw);
     if compressed.len()+16 < raw.len() { (compressed,true) } else { (raw,false) }
+}
+
+/// Whether the REAL bitmap marks row `i` of an INTEGER column.
+fn real_row(bytes: &[u8], rows: usize, i: usize) -> bool {
+    bytes.len() > block_bytes(rows) && bytes[block_bytes(rows) + i / 8] & (1 << (i % 8)) != 0
+}
+
+/// The cell at row `i` of a decoded column payload.
+fn cell_at(bytes: &[u8], rows: usize, i: usize, kind: Kind) -> Cell {
+    match bits(bytes, rows, i) {
+        None => Cell::Null,
+        Some(n) if kind == Kind::Real || real_row(bytes, rows, i) => Cell::Real(n),
+        Some(n) => Cell::Integer(n as i64),
+    }
 }
 
 /// An empty block stands for a column whose rows are all NULL.
@@ -371,8 +411,8 @@ fn bits(bytes: &[u8], rows: usize, i: usize) -> Option<u64> {
 
 fn number(bytes: &[u8], rows: usize, i: usize, kind: Kind) -> Option<f64> {
     bits(bytes, rows, i).map(|value| match kind {
-        Kind::Integer => (value as i64) as f64,
-        Kind::Real => f64::from_bits(value),
+        Kind::Integer if !real_row(bytes, rows, i) => (value as i64) as f64,
+        _ => f64::from_bits(value),
     })
 }
 
@@ -385,62 +425,8 @@ fn null_column() -> Arc<[u8]> {
     EMPTY.get_or_init(|| Arc::from(Vec::new())).clone()
 }
 
-/// The manifest stored at `offset`, parsed and validated once per process.
-/// `base` applies the identity of indices written before identities existed.
-fn manifest_at(file: &mut File, shared: &mut SharedFile, (offset, length, checksum): (u64, u64, u32), base: bool) -> Result<Arc<Manifest>> {
-    if let Some((_, manifest)) = shared.manifests.iter().find(|(key, _)| *key == (offset, length, checksum)) {
-        return Ok(manifest.clone());
-    }
-    file.seek(SeekFrom::Start(offset))?;
-    let mut metadata = vec![0; length as usize];
-    file.read_exact(&mut metadata)?;
-    ensure!(crc32fast::hash(&metadata) == checksum, "index checksum mismatch");
-    let mut manifest: Manifest = serde_json::from_slice(&metadata)?;
-    if base && manifest.id.is_empty() { manifest.id = format!("legacy-{offset}-{checksum}"); }
-    for table in &manifest.tables {
-        ensure!(
-            table
-                .columns
-                .iter()
-                .any(|c| c.name == "dateTime" && matches!(c.kind, Kind::Integer)),
-            "invalid timestamp column"
-        );
-        let mut previous = None;
-        let mut row_count = 0;
-        for block in &table.blocks {
-            ensure!(
-                block.rows > 0
-                    && block.rows <= BLOCK_ROWS
-                    && block.first <= block.last
-                    && previous.is_none_or(|p| block.first > p)
-                && block.columns.len() <= table.columns.len(),
-                "invalid block index"
-            );
-            for column in &block.columns {
-                ensure!(
-                    (column.length == 0 || (!column.compressed && column.length == block_bytes(block.rows))
-                        || (column.compressed && column.length < block_bytes(block.rows)))
-                        && column.offset >= HEADER_BYTES
-                        && column
-                            .offset
-                            .checked_add(column.length as u64)
-                            .is_some_and(|end| end <= offset),
-                    "invalid column bounds"
-                );
-                ensure!(
-                    column.length != 0 || column.checksum == crc32fast::hash(&[]),
-                    "invalid NULL column"
-                );
-            }
-            previous = Some(block.last);
-            row_count += block.rows as u64;
-        }
-        ensure!(row_count == table.rows, "row count mismatch");
-    }
-    let manifest = Arc::new(manifest);
-    if shared.manifests.len() >= SHARED_MANIFESTS { shared.manifests.remove(0); }
-    shared.manifests.push(((offset, length, checksum), manifest.clone()));
-    Ok(manifest)
+fn new_cache() -> Arc<std::sync::Mutex<BlockCache>> {
+    Arc::new(std::sync::Mutex::new(BlockCache { blocks: HashMap::new(), order: VecDeque::new(), bytes: 0, limit: 0 }))
 }
 
 fn new_id() -> Result<String> {
@@ -450,222 +436,132 @@ fn new_id() -> Result<String> {
 }
 
 /// Import a consistent read snapshot without modifying or replacing the source.
-/// Only archive and its *_day_* tables belong to this experimental format.
+/// The archive table, its daily-summary tables and their metadata are copied.
 pub fn import_sqlite(source: &Path, destination: &Path, archive: &str) -> Result<()> {
     let mut source = open_sqlite(source, 1024 * 1024)?;
     let transaction = source.transaction()?;
-    let parent = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut output = tempfile::NamedTempFile::new_in(parent)?;
-    output.write_all(&[0; HEADER_BYTES as usize])?;
-    let mut manifest = Manifest {
-        archive: archive.to_owned(),
-        tables: vec![],
-        metadata: vec![],
-        id: new_id()?,
-        lsn: 0,
-    };
-    let mut schema = transaction
-        .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")?;
-    let definitions = schema
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
+    let definitions = transaction
+        .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")?
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    ensure!(
-        definitions.iter().any(|(name, _)| name == archive),
-        "archive table {archive:?} missing"
-    );
-    for (name, sql) in definitions {
-        if name != archive && !name.starts_with(&format!("{archive}_day_")) {
-            continue;
-        }
-        if name == format!("{archive}_day__metadata") {
-            let mut statement = transaction.prepare(&format!("SELECT * FROM {}", quote(&name)))?;
-            let count = statement.column_count();
-            let mut rows = statement.query([])?;
-            let mut data = Vec::new();
-            while let Some(row) = rows.next()? {
-                data.push(
-                    (0..count)
-                        .map(|i| Cell::read(row.get_ref(i)?))
-                        .collect::<Result<Vec<_>>>()?,
-                );
-                ensure!(
-                    data.len() <= 4096,
-                    "metadata table is too large for this prototype"
-                );
+    ensure!(definitions.iter().any(|(name, _)| name == archive), "archive table {archive:?} missing");
+    container::Container::create(destination, archive, |output| {
+        let mut next_table = 1;
+        let mut next_chunk = 1;
+        for (name, sql) in definitions {
+            if name != archive && !name.starts_with(&format!("{archive}_day_")) {
+                continue;
             }
-            manifest.metadata.push(MetadataTable {
-                name,
-                sql,
-                rows: data,
-            });
-            continue;
-        }
-        let mut pragma = transaction.prepare(&format!("PRAGMA table_info({})", quote(&name)))?;
-        let columns = pragma
-            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?,r.get::<_,Option<String>>(4)?)))?
-            .map(|r| {
-                let (name, declared, not_null, default) = r?;
-                let kind = column_kind(&declared)?;
-                let default = default.map(|value| transaction.query_row(&format!("SELECT {value}"),[],|r|r.get::<_,Value>(0))).transpose()?;
-                let default = default.map(|value|Cell::read(ValueRef::from(&value))).transpose()?.map(|c|numeric_cell(kind,c));
-                Ok(Column { not_null: not_null || name == "dateTime", default, name, kind })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let time_index = columns
-            .iter()
-            .position(|c| c.name == "dateTime")
-            .context("dateTime missing")?;
-        ensure!(
-            matches!(columns[time_index].kind, Kind::Integer),
-            "dateTime must be INTEGER"
-        );
-        let mut table = Table {
-            name,
-            sql,
-            columns,
-            blocks: vec![],
-            rows: 0,
-        };
-        let mut select = transaction.prepare(&format!(
-            "SELECT * FROM {} ORDER BY dateTime",
-            quote(&table.name)
-        ))?;
-        let mut rows = select.query([])?;
-        let mut previous = None;
-        loop {
+            if name == format!("{archive}_day__metadata") {
+                let mut statement = transaction.prepare(&format!("SELECT * FROM {}", quote(&name)))?;
+                let count = statement.column_count();
+                let mut rows = statement.query([])?;
+                let mut data = Vec::new();
+                while let Some(row) = rows.next()? {
+                    data.push((0..count).map(|i| Cell::read(row.get_ref(i)?)).collect::<Result<Vec<_>>>()?);
+                    ensure!(data.len() <= 4096, "metadata table {name} has more than 4096 rows");
+                }
+                output.write_metadata(&MetadataTable { name, sql, rows: data })?;
+                continue;
+            }
+            let columns = transaction
+                .prepare(&format!("PRAGMA table_info({})", quote(&name)))?
+                .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?, r.get::<_, Option<String>>(4)?)))?
+                .map(|r| {
+                    let (column, declared, not_null, default) = r?;
+                    let kind = column_kind(&declared).with_context(|| format!("{name}.{column}"))?;
+                    let default = default.map(|value| transaction.query_row(&format!("SELECT {value}"), [], |r| r.get::<_, Value>(0))).transpose()?;
+                    let default = default.map(|value| Cell::read(ValueRef::from(&value))).transpose()?.map(|c| numeric_cell(kind, c));
+                    Ok(Column { not_null: not_null || column == "dateTime", default, name: column, kind })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let time_index = columns.iter().position(|c| c.name == "dateTime").with_context(|| format!("{name} has no dateTime column"))?;
+            ensure!(matches!(columns[time_index].kind, Kind::Integer), "{name}.dateTime must be INTEGER");
+            let mut table = Table { ordinal: next_table, name, sql, columns, blocks: vec![], rows: 0 };
+            next_table += 1;
+            let mut select = transaction.prepare(&format!("SELECT * FROM {} ORDER BY dateTime", quote(&table.name)))?;
+            let mut rows = select.query([])?;
+            let mut previous = None;
             let limit = rows_per_block(&table.name);
-            let mut values = vec![Vec::with_capacity(limit); table.columns.len()];
-            let mut times = Vec::with_capacity(limit);
-            while times.len() < limit {
-                let Some(row) = rows.next()? else { break };
-                let ts = row.get::<_, i64>(time_index)?;
-                ensure!(
-                    previous.is_none_or(|p| ts > p),
-                    "timestamps must be unique and increasing"
-                );
-                previous = Some(ts);
-                times.push(ts);
-                for (i, column) in table.columns.iter().enumerate() {
-                    let value = match (column.kind, row.get_ref(i)?) {
-                        (_, ValueRef::Null) => None,
-                        (Kind::Integer, ValueRef::Integer(value)) => Some(value as u64),
-                        (Kind::Real, ValueRef::Real(value)) if value.is_finite() => {
-                            Some(value.to_bits())
-                        }
-                        _ => bail!(
-                            "unsupported value in {}.{} at {ts}",
-                            table.name,
-                            column.name
-                        ),
-                    };
-                    values[i].push(value);
+            loop {
+                let mut batch = Vec::with_capacity(limit);
+                while batch.len() < limit {
+                    let Some(row) = rows.next()? else { break };
+                    let at = row.get_ref(time_index)?;
+                    let mut cells = Vec::with_capacity(table.columns.len());
+                    for (i, column) in table.columns.iter().enumerate() {
+                        let cell = numeric_cell(column.kind, Cell::read(row.get_ref(i)?)?);
+                        store::validate_cell(column, &cell).with_context(|| format!("{} at dateTime {at:?}", table.name))?;
+                        cells.push(cell);
+                    }
+                    let Cell::Integer(time) = cells[time_index] else { bail!("{}.dateTime must be an integer", table.name) };
+                    ensure!(previous.is_none_or(|p| time > p), "timestamps must be unique and increasing in {}", table.name);
+                    previous = Some(time);
+                    batch.push(cells);
                 }
+                if batch.is_empty() { break; }
+                store::write_block(output, &mut next_chunk, &table.columns, &batch, &mut table.blocks)?;
             }
-            if times.is_empty() {
-                break;
-            }
-            let mut block = Block {
-                rows: times.len(),
-                first: times[0],
-                last: *times.last().unwrap(),
-                columns: vec![],
-            };
-            for (ci, column) in values.into_iter().enumerate() {
-                let (bytes,compressed) = stored_column(&column);
-                let mut stats = Accumulator::default();
-                for value in &column {
-                    stats.add(value.map(|bits| match table.columns[ci].kind {
-                        Kind::Integer => (bits as i64) as f64,
-                        Kind::Real => f64::from_bits(bits),
-                    }));
-                }
-                let offset = output.stream_position()?;
-                output.write_all(&bytes)?;
-                block.columns.push(ColumnBlock {
-                    offset,
-                    length: bytes.len(),
-                    checksum: crc32fast::hash(&bytes),
-                    stats: Some(stats.finish()),
-                    compressed,
-                });
-            }
-            table.rows += times.len() as u64;
-            table.blocks.push(block);
+            table.rows = table.blocks.iter().map(|b| b.rows as u64).sum();
+            output.write_table(&table)?;
+            output.write_blocks(table.ordinal, &[], &table.blocks)?;
         }
-        manifest.tables.push(table);
-    }
-    let metadata = serde_json::to_vec(&manifest)?;
-    ensure!(
-        metadata.len() as u64 <= MAX_MANIFEST_BYTES,
-        "index exceeds prototype limit"
-    );
-    let offset = output.stream_position()?;
-    output.write_all(&metadata)?;
-    output.seek(SeekFrom::Start(0))?;
-    output.write_all(MAGIC)?;
-    output.write_all(&offset.to_le_bytes())?;
-    output.write_all(&(metadata.len() as u64).to_le_bytes())?;
-    output.write_all(&crc32fast::hash(&metadata).to_le_bytes())?;
-    output.as_file().sync_all()?;
-    output
-        .persist_noclobber(destination)
-        .context("destination must not already exist")?;
-    #[cfg(unix)]
-    File::open(parent)?.sync_all()?;
-    Ok(())
+        output.set_counter("next_table", next_table)?;
+        output.set_counter("next_chunk", next_chunk)?;
+        Ok(())
+    })
 }
 
 impl Database {
+    /// Open a database for reading only, without its uncompacted changes.
     pub fn open(path: &Path, cache_limit: usize) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let metadata = file.metadata()?;
-        let size = metadata.len();
-        #[cfg(unix)]
-        let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
-        #[cfg(not(unix))]
-        let inode = 0;
-        let mut header = [0; HEADER_BYTES as usize];
-        file.read_exact(&mut header)
-            .context("truncated database header")?;
-        ensure!(&header[..8] == MAGIC || &header[..8] == b"WWXDB001", "unsupported database format");
-        let offset = u64::from_le_bytes(header[8..16].try_into()?);
-        let length = u64::from_le_bytes(header[16..24].try_into()?);
-        let checksum = u32::from_le_bytes(header[24..28].try_into()?);
-        ensure!(
-            length <= MAX_MANIFEST_BYTES
-                && offset >= HEADER_BYTES
-                && offset.checked_add(length).is_some_and(|end| end <= size),
-            "invalid index bounds"
-        );
-        let mut files = shared_files().lock().map_err(|_| anyhow::anyhow!("database registry poisoned"))?;
-        let shared = files.entry((std::fs::canonicalize(path)?, inode)).or_insert_with(|| SharedFile {
-            manifests: Vec::new(),
-            cache: Arc::new(std::sync::Mutex::new(BlockCache { blocks: HashMap::new(), order: VecDeque::new(), bytes: 0, limit: 0 })),
-        });
-        let mut manifest = manifest_at(&mut file, shared, (offset, length, checksum), true)?;
-        if let Some(head) = store::read_head(path)? {
-            ensure!(head.id == manifest.id, "checkpoint belongs to another database");
-            if head.lsn > manifest.lsn {
-                ensure!(head.length <= MAX_MANIFEST_BYTES && head.offset >= HEADER_BYTES
-                    && head.offset.checked_add(head.length).is_some_and(|end| end <= size), "invalid checkpoint bounds");
-                let latest = manifest_at(&mut file, shared, (head.offset, head.length, head.checksum), false)
-                    .context("checkpoint index")?;
-                ensure!(latest.id == manifest.id && latest.lsn == head.lsn, "invalid checkpoint identity");
-                manifest = latest;
+        let container = container::Container::open(path, std::time::Duration::from_secs(5), true)?;
+        let mut database = Self::new(container, cache_limit);
+        database.container.begin_read()?;
+        let loaded = database.container.meta().and_then(|meta| database.load_index(&meta, true));
+        database.container.rollback();
+        loaded?;
+        Ok(database)
+    }
+
+    pub(crate) fn new(container: container::Container, cache_limit: usize) -> Self {
+        let manifest = Arc::new(Manifest { archive: String::new(), tables: Arc::new(vec![]), metadata: vec![], id: String::new(), lsn: 0, generation: 0 });
+        Self { container, manifest, cache: new_cache(), cache_limit, metrics: ReadMetrics::default() }
+    }
+
+    /// Read the block index and metadata tables of `meta`. With `committed`,
+    /// the process shares the index: only state read outside a write
+    /// transaction is known to be committed.
+    pub(crate) fn load_index(&mut self, meta: &container::Meta, committed: bool) -> Result<()> {
+        let path = self.container.path.clone();
+        let mut tables = None;
+        if committed {
+            let mut files = shared_files().lock().map_err(|_| anyhow::anyhow!("database registry poisoned"))?;
+            let shared = files.entry(path.clone()).or_insert_with(|| SharedFile { id: meta.uuid.clone(), indices: vec![], cache: new_cache() });
+            // Another database now lives at this path.
+            if shared.id != meta.uuid { *shared = SharedFile { id: meta.uuid.clone(), indices: vec![], cache: new_cache() }; }
+            self.cache = shared.cache.clone();
+            tables = shared.indices.iter().find(|(generation, _)| *generation == meta.generation).map(|(_, tables)| tables.clone());
+        }
+        let tables = match tables {
+            Some(tables) => tables,
+            None => {
+                let loaded = Arc::new(self.container.load_tables()?);
+                if committed && let Ok(mut files) = shared_files().lock() && let Some(shared) = files.get_mut(&path).filter(|s| s.id == meta.uuid) {
+                    shared.indices.retain(|(generation, _)| *generation != meta.generation);
+                    if shared.indices.len() >= SHARED_INDICES { shared.indices.remove(0); }
+                    shared.indices.push((meta.generation, loaded.clone()));
+                }
+                loaded
             }
-        }
-        let cache = shared.cache.clone();
-        drop(files);
+        };
         {
-            let mut cache = cache.lock().map_err(|_| anyhow::anyhow!("block cache poisoned"))?;
-            cache.limit = cache.limit.max(cache_limit);
+            let mut cache = self.cache.lock().map_err(|_| anyhow::anyhow!("block cache poisoned"))?;
+            cache.limit = cache.limit.max(self.cache_limit);
         }
-        Ok(Self { file, manifest, cache, cache_limit, metrics: ReadMetrics::default() })
+        let metadata = self.container.load_metadata()?;
+        self.manifest = Arc::new(Manifest { archive: meta.archive.clone(), tables, metadata, id: meta.uuid.clone(), lsn: meta.seq, generation: meta.generation });
+        Ok(())
     }
 
     pub fn info(&self) -> Info {
@@ -688,6 +584,7 @@ impl Database {
                 .iter()
                 .map(|t| t.name.clone())
                 .collect(),
+            blocks: self.manifest.tables.iter().map(|t| (t.name.clone(), (t.rows, t.blocks.len()))).collect(),
             cache_bytes: self.cache.lock().map_or(0, |c| c.bytes),
             cache_limit_bytes: self.cache.lock().map_or(self.cache_limit, |c| c.limit),
             reads: self.metrics.clone(),
@@ -723,36 +620,38 @@ impl Database {
         if column.length == 0 {
             return Ok(null_column());
         }
-        if let Some(bytes) = self.cache.lock().map_err(|_| anyhow::anyhow!("block cache poisoned"))?.blocks.get(&column.offset) {
+        if let Some((checksum, bytes)) = self.cache.lock().map_err(|_| anyhow::anyhow!("block cache poisoned"))?.blocks.get(&column.chunk)
+            && *checksum == column.checksum {
             return Ok(bytes.clone());
         }
         let expected = block_bytes(block.rows);
-        let compressed = column.compressed;
-        let mut bytes = vec![0; column.length];
-        self.file.seek(SeekFrom::Start(column.offset))?;
-        self.file.read_exact(&mut bytes)?;
+        // INTEGER columns may carry a bitmap of REAL rows after the values.
+        let mixed = self.manifest.tables[ti].columns[ci].kind == Kind::Integer;
+        let largest = expected + if mixed { block.rows.div_ceil(8) } else { 0 };
+        let (chunk, length, checksum, compressed) = (column.chunk, column.length, column.checksum, column.compressed);
+        let mut bytes = self.container.read_chunk(chunk)?;
         self.metrics.column_reads += 1;
         self.metrics.bytes_read += bytes.len() as u64;
-        ensure!(
-            crc32fast::hash(&bytes) == column.checksum,
-            "column checksum mismatch"
-        );
+        ensure!(bytes.len() == length && crc32fast::hash(&bytes) == checksum, "column chunk {chunk} checksum mismatch");
         if compressed {
-            bytes = lz4_flex::block::decompress(&bytes,expected).context("invalid compressed column")?;
-            ensure!(bytes.len() == expected,"invalid decompressed column length");
+            bytes = lz4_flex::block::decompress(&bytes, largest).with_context(|| format!("invalid compressed column chunk {chunk}"))?;
         }
+        ensure!(bytes.len() == expected || bytes.len() == largest, "invalid length of column chunk {chunk}");
         let bytes: Arc<[u8]> = bytes.into();
-        let offset = column.offset;
         let mut cache = self.cache.lock().map_err(|_| anyhow::anyhow!("block cache poisoned"))?;
-        if bytes.len() <= cache.limit && !cache.blocks.contains_key(&offset) {
+        if bytes.len() <= cache.limit {
+            if let Some((_, old)) = cache.blocks.remove(&chunk) {
+                cache.bytes -= old.len();
+                cache.order.retain(|&id| id != chunk);
+            }
             while cache.bytes + bytes.len() > cache.limit {
                 let oldest = cache.order.pop_front().unwrap();
-                let removed = cache.blocks.remove(&oldest).unwrap().len();
+                let removed = cache.blocks.remove(&oldest).unwrap().1.len();
                 cache.bytes -= removed;
             }
             cache.bytes += bytes.len();
-            cache.order.push_back(offset);
-            cache.blocks.insert(offset, bytes.clone());
+            cache.order.push_back(chunk);
+            cache.blocks.insert(chunk, (checksum, bytes.clone()));
         }
         Ok(bytes)
     }
@@ -920,15 +819,7 @@ impl Database {
                             columns
                                 .iter()
                                 .enumerate()
-                                .map(|(ci, bytes)| match bits(bytes, n, i) {
-                                    None => Value::Null,
-                                    Some(value) => {
-                                        match self.manifest.tables[ti].columns[ci].kind {
-                                            Kind::Integer => Value::Integer(value as i64),
-                                            Kind::Real => Value::Real(f64::from_bits(value)),
-                                        }
-                                    }
-                                });
+                                .map(|(ci, bytes)| cell_at(bytes, n, i, self.manifest.tables[ti].columns[ci].kind).value());
                         insert.execute(params_from_iter(values))?;
                     }
                 }
@@ -945,12 +836,22 @@ impl Database {
             }
             transaction.commit()?;
         }
-        output.as_file().sync_all()?;
-        output
-            .persist_noclobber(destination)
-            .context("destination must not already exist")?;
-        #[cfg(unix)]
-        File::open(parent)?.sync_all()?;
-        Ok(())
+        publish_file(output, destination)
     }
+}
+
+/// Give a finished temporary file the permissions of a new file, synchronize
+/// it and move it to `destination`, which must not exist.
+pub(crate) fn publish_file(output: tempfile::NamedTempFile, destination: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // tempfile creates mode 0600; other tools expect what SQLite creates.
+        let mask = unsafe { libc::umask(0o022) };
+        unsafe { libc::umask(mask) };
+        output.as_file().set_permissions(std::fs::Permissions::from_mode(0o644 & !(mask as u32)))?;
+    }
+    output.as_file().sync_all()?;
+    output.persist_noclobber(destination).with_context(|| format!("destination must not already exist: {}", destination.display()))?;
+    container::sync_directory(destination)
 }

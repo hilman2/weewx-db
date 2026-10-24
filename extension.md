@@ -32,7 +32,7 @@ it with `weectl`. For example:
 
 ```sh
 sha256sum --ignore-missing --check SHA256SUMS
-weectl extension install weewx-db-0.2.0-aarch64-unknown-linux-gnu.zip
+weectl extension install weewx-db-0.3.0-aarch64-unknown-linux-gnu.zip
 ```
 
 On macOS, run `shasum -a 256 ARCHIVE.zip` and compare the printed hash with
@@ -52,6 +52,18 @@ Stop WeeWX, install the new archive with `weectl extension install` as above,
 then start WeeWX again. The installer keeps your `weewx_rust` settings. WeeWX
 releases before 5.5 overwrite the Rust module in place, which crashes a
 running `weewxd`.
+
+Version 0.3 stores the database in a new file format. Before installing it
+over 0.2, stop WeeWX and export the current data with the old CLI:
+
+```sh
+~/weewx-data/bin/user/weewxdb/weewx-db export \
+    ~/weewx-data/archive/weewx.wwdb ~/weewx-data/archive/weewx-0.2.sdb
+```
+
+After the upgrade, move the old `weewx.wwdb` and its sidecar files away and
+import `weewx-0.2.sdb` as described in the README. Version 0.3 refuses to open
+a 0.2 file and says so.
 
 ## Import and select your database
 

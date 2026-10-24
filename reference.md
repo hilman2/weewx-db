@@ -3,10 +3,14 @@
 ## Schema and migration
 
 Numeric tables use a unique INTEGER `dateTime` and INTEGER or REAL sensor
-columns. Numeric affinity accepts integral floating-point weights, numeric
-strings and INTEGER values for REAL columns. Non-finite measurements fail.
-INTEGER storage preserves 64-bit values; REAL storage preserves finite bits.
-The dateTime key, NOT NULL and numeric defaults are enforced.
+columns. Values follow SQLite's numeric affinity: numeric strings become
+numbers, integral floating-point values in INTEGER columns become integers,
+and other REAL values stay REAL in an INTEGER column. INTEGER storage
+preserves 64-bit values; REAL storage preserves the bits, including infinity
+and negative zero; NaN is stored as NULL. Text that is not a number fails with
+"datatype mismatch", which WeeWX treats like a duplicate record. The dateTime
+key, NOT NULL and numeric defaults are enforced; an INSERT that omits a NOT
+NULL column with a default stores the default.
 
 CREATE TABLE, DROP TABLE and ALTER TABLE ADD COLUMN are supported. New columns
 use NULL or their default for older records. A new NOT NULL column needs a
@@ -16,9 +20,11 @@ triggers, views and column removal/renaming are outside the supported schema.
 Small tables without dateTime are metadata tables, limited to 4,096 rows.
 
 Import includes the selected archive, its numeric `*_day_*` tables and its
-`*_day__metadata` table. It preserves stored daily values, including LOOP
+`*_day__metadata` table. Columns declared NUMERIC, DECIMAL, BOOLEAN or without
+a type are stored as REAL; text columns stop the import. It preserves stored daily values, including LOOP
 extrema and time weights. Unrelated tables and user indices are not imported.
-Export includes committed journal changes and current schema definitions.
+Export includes committed changes that are not yet compacted, and the current
+schema definitions.
 
 ## SQL and calculations
 
@@ -154,8 +160,8 @@ DB-API connection, or export a SQLite file for tools that require that format.
 | `cache_mib` | 32 | Maximum cached, decompressed column bytes; connections to the same file in one process share the largest requested cache, and zero for all of them disables it |
 | `workspace_mib` | 32 | Budget for native interval results, rolling windows, materialized SQL cells, fetch batches and exact percentiles |
 | `result_cache` | 4096 | weedb driver only: aggregate results kept per database and generation, at most two generations; zero disables the cache |
-| `timeout` | 5 | Maximum seconds waiting for the database writer lock |
-| `sync_mode` | background | Journal synchronization policy |
+| `timeout` | 5 | Maximum seconds a write waits for another writer |
+| `sync_mode` | always | Commit durability: `always` or `background` |
 
 Aggregate results let report runs reuse statistics of periods that received
 no new data. Skins with many statistics pages, such as Neowx-Material, reuse
@@ -164,31 +170,29 @@ more results with `result_cache = 16384`, at about 20 MiB more memory.
 SQL and batch CLI commands expose `--cache-mib` and `--workspace-mib`.
 The workspace budget is per connection or operation, the cache budget per file
 and process; neither is a total RSS cap. Indices, the
-journal overlay, Python objects, concurrent aggregate groups, SQLite workspace
+overlay of changed rows, SQLite's page cache of 2 MiB per connection, Python objects, concurrent aggregate groups, SQLite workspace
 and the OS file cache use additional memory. SQLite temporary sorts may spill
 to disk. XType exact percentiles share one sample budget across all output
 bins and reserve 32 bytes per reading for capacity and sorting. SQL percentile
 states have individual budgets; concurrent SQL groups can exceed one state's
 limit in total. Large output should use streaming or narrower time spans.
 
-`background` acknowledges a transaction after appending its journal frame and
-starts data synchronization in a worker. Every subsequent writer synchronizes
-the predecessor before appending, including writers in another process. At
-most the newest acknowledged transaction can be lost after a process or power
-failure. During normal WeeWX operation that transaction contains one archive
-record and its daily updates. A bulk transaction can contain many records.
-`always` synchronizes the journal before acknowledging each commit. The Rust
-Store API and CLI default to always; Python and the weedb driver default to
-background. Python `connection.flush()`, clean close and checkpoints wait for
-synchronization.
+`always` synchronizes each commit before it returns (SQLite
+`synchronous=FULL` in WAL mode), so an acknowledged transaction survives a
+process crash and a power failure. `background` (`synchronous=NORMAL`) skips
+that synchronization; after a power failure the transactions since the last
+WAL checkpoint can be lost, but the file stays consistent. Python
+`connection.flush()` runs a WAL checkpoint.
 
-One writer owns the journal lock. Readers retain a snapshot without keeping
-the writer lock. Streaming read cursors pin their connection's snapshot until
-closed. Writes on that connection require those cursors to be closed. Nested
-read cursors are allowed. Each transaction is limited to a 16 MiB serialized
-journal frame; smaller batches keep replay memory bounded. Serialized indices
-are limited to 16 MiB. A checkpoint starts automatically when the journal has
-reached 8 MiB before the next transaction.
+One writer at a time holds SQLite's write lock; another writer waits up to
+`timeout` seconds and then fails with "database is locked". Readers never wait
+for a writer and see the last transaction committed before their statement.
+Streaming read cursors keep their connection's snapshot until closed. Writes
+on that connection can run while such a cursor is open; the automatic
+compaction then waits for a later transaction. Schema changes need closed
+cursors. A transaction is staged in memory until commit and is limited to
+256 MiB. When a table has 1,024 changed rows, or all tables 16,384, the next
+transaction first folds them into blocks.
 
 Linux x86_64 is tested here. The code uses portable Rust, bundled SQLite and
 portable LZ4, with no x86-specific instruction requirement. Build and measure

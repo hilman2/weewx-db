@@ -1,16 +1,28 @@
-//! Journaled mutations over immutable, indexed column blocks.
+//! Transactions over immutable, indexed column blocks.
+//!
+//! A `Store` keeps a snapshot in memory: the block index of the file and the
+//! rows changed since the last compaction, which override the blocks.
+//! Writes are staged in memory and written to the file in one SQLite
+//! transaction at commit. A compaction folds the changed rows into blocks.
 
 use super::*;
+use crate::container::Container;
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const WAL_MAGIC: &[u8; 8] = b"WWXWAL03";
-const RELAXED_FRAME: u32 = 1 << 31;
-const MAX_FRAME: usize = 16 * 1024 * 1024;
-const CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+/// Changed rows of one table that start a compaction before the next write.
+const COMPACT_TABLE_ROWS: usize = 1024;
+/// Changed rows of all tables that start a compaction.
+const COMPACT_ROWS: usize = 16384;
+/// Staged bytes after which a transaction is refused. Staged rows are held in
+/// memory until commit.
+const MAX_TRANSACTION_BYTES: usize = 256 * 1024 * 1024;
 
+/// How a commit reaches the disk. `Always` (SQLite synchronous=FULL) makes
+/// every acknowledged transaction survive a power failure. `Background`
+/// (synchronous=NORMAL) can lose the transactions since the last WAL
+/// checkpoint after a power failure, but never corrupts the file.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum SyncMode { Always, Background }
 
@@ -21,206 +33,128 @@ impl std::str::FromStr for SyncMode {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub(crate) struct Head {
-    pub id: String,
-    pub lsn: u64,
-    pub offset: u64,
-    pub length: u64,
-    pub checksum: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct WalHeader { id: String, base_lsn: u64 }
-
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 enum Mutation {
-    Put { table: String, time: i64, row: Option<Vec<Cell>> },
-    Create { name: String, sql: String, columns: Vec<Column> },
+    Put { table: String, ordinal: u64, time: i64, row: Option<Vec<Cell>> },
+    Create { name: String, sql: String, columns: Vec<Column>, ordinal: u64 },
     Metadata { name: String, sql: String, rows: Vec<Vec<Cell>> },
     Add { table: String, column: Column, sql: String },
-    Drop { table: String },
+    Drop { table: String, ordinal: Option<u64> },
 }
 
-/// Journal rows of one table. Cursors share the map; a write copies it only
+impl Mutation {
+    fn bytes(&self) -> usize {
+        match self {
+            Mutation::Put { row, .. } => 32 + row.as_ref().map_or(0, |r| r.len() * 9),
+            Mutation::Metadata { rows, .. } => 64 + rows.iter().map(|r| r.len() * 16).sum::<usize>(),
+            _ => 1024,
+        }
+    }
+}
+
+/// Changed rows of one table. Cursors share the map; a write copies it only
 /// while a cursor still reads the previous version.
 pub(crate) type TableChanges = Arc<BTreeMap<i64, Option<Vec<Cell>>>>;
 type Changes = BTreeMap<String, TableChanges>;
 
-/// Identity, length and modification time of the main file and journal.
-/// Every commit, checkpoint and vacuum changes at least one of them.
-type Stamp = [Option<(u64, u64, std::time::SystemTime)>; 2];
-
-pub fn sidecar(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(suffix);
-    name.into()
-}
-
-pub(crate) fn read_head(path: &Path) -> Result<Option<Head>> {
-    match std::fs::read(sidecar(path, ".head")) {
-        Ok(bytes) => {
-            ensure!(bytes.len() >= 4 && bytes.len() <= 4096, "invalid checkpoint pointer");
-            let checksum = u32::from_le_bytes(bytes[..4].try_into()?);
-            ensure!(crc32fast::hash(&bytes[4..]) == checksum, "checkpoint pointer checksum mismatch");
-            Ok(Some(serde_json::from_slice(&bytes[4..])?))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn file_stamp(path: &Path) -> Result<Option<(u64, u64, std::time::SystemTime)>> {
-    match std::fs::metadata(path) {
-        #[cfg(unix)]
-        Ok(meta) => Ok(Some((std::os::unix::fs::MetadataExt::ino(&meta), meta.len(), meta.modified()?))),
-        #[cfg(not(unix))]
-        Ok(meta) => Ok(Some((0, meta.len(), meta.modified()?))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None), Err(e) => Err(e.into()),
-    }
-}
-
-fn parent(path: &Path) -> &Path {
-    path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))
-}
-
-fn sync_parent(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    File::open(parent(path))?.sync_all()?;
-    Ok(())
-}
-
-fn write_header(output: &mut File, manifest: &Manifest) -> Result<()> {
-    let bytes = serde_json::to_vec(manifest)?;
-    ensure!(bytes.len() as u64 <= MAX_MANIFEST_BYTES, "index size limit exceeded");
-    let offset = output.stream_position()?;
-    output.write_all(&bytes)?;
-    output.seek(SeekFrom::Start(0))?;
-    output.write_all(MAGIC)?;
-    output.write_all(&offset.to_le_bytes())?;
-    output.write_all(&(bytes.len() as u64).to_le_bytes())?;
-    output.write_all(&crc32fast::hash(&bytes).to_le_bytes())?;
-    Ok(())
-}
-
-fn lock(path: &Path, exclusive: bool, timeout: Duration) -> Result<File> {
-    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
-        .open(sidecar(path, ".lock"))?;
-    let start = Instant::now();
-    loop {
-        let result = if exclusive { fs2::FileExt::try_lock_exclusive(&file) }
-            else { fs2::FileExt::try_lock_shared(&file) };
-        match result {
-            Ok(()) => return Ok(file),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && start.elapsed() < timeout =>
-                std::thread::sleep(Duration::from_millis(5)),
-            Err(e) => return Err(e).context("database is locked"),
-        }
-    }
-}
+pub fn sidecar(path: &Path, suffix: &str) -> PathBuf { crate::container::sidecar(path, suffix) }
 
 #[derive(Debug, Serialize)]
 pub struct StoreInfo {
     #[serde(flatten)]
     pub snapshot: Info,
+    pub format_version: i32,
     pub lsn: u64,
-    pub journal_bytes: u64,
+    pub generation: u64,
     pub changed_rows: usize,
     pub indexed_columns: usize,
     pub summarized_blocks: usize,
+    pub file_bytes: u64,
+    pub free_bytes: u64,
 }
 
 pub struct Store {
     pub(crate) snapshot: Database,
     pub(crate) changes: Changes,
-    path: PathBuf,
     lsn: u64,
-    valid_wal_bytes: u64,
-    writer: Option<File>,
+    writing: bool,
     pending: Vec<Mutation>,
     pending_bytes: usize,
     timeout: Duration,
-    stamp: Stamp,
+    /// PRAGMA data_version when the snapshot was read; another connection's
+    /// commit changes it.
+    data_version: i64,
     pub workspace_bytes: usize,
     sync_mode: SyncMode,
-    pending_sync: Option<(u64,std::thread::JoinHandle<std::io::Result<()>>)>,
-    last_relaxed: bool,
-    legacy_wal: bool,
-    /// Results of `aggregate` for the current snapshot and journal. Reports
-    /// repeat queries such as the first and last timestamp many times.
+    /// The next table ordinal, read when a write transaction begins.
+    next_table: u64,
+    /// Results of `aggregate` for the current snapshot. Reports repeat
+    /// queries such as the first and last timestamp many times.
     aggregates: HashMap<(usize, String, i64, i64, bool), Stats>,
-    /// Canonical path identifying this file in the process-wide change log.
+    /// Resolved path identifying this database in process-wide state.
     canonical: PathBuf,
 }
 
 impl Store {
     pub fn drop_database(path: &Path) -> Result<()> {
-        let guard = lock(path,true,Duration::from_secs(5))?;
-        Database::open(path,0)?;
-        std::fs::remove_file(path)?;
-        for suffix in [".head",".wal"] {
-            match std::fs::remove_file(sidecar(path,suffix)) {
+        let path = crate::container::resolve(path)?;
+        {
+            // Refuses a file that is not a database, and waits for a writer.
+            let container = Container::open(&path, Duration::from_secs(5), false)?;
+            container.begin_write()?;
+            container.rollback();
+        }
+        std::fs::remove_file(&path)?;
+        for suffix in ["-wal", "-shm"] {
+            match std::fs::remove_file(sidecar(&path, suffix)) {
                 Ok(()) => (), Err(e) if e.kind() == std::io::ErrorKind::NotFound => (), Err(e) => return Err(e.into()),
             }
         }
-        sync_parent(path)?;
-        drop(guard);
-        Ok(())
+        crate::container::sync_directory(&path)
     }
+
     /// Create an empty database; tables can then be created transactionally.
     pub fn create(path: &Path, archive: &str) -> Result<()> {
-        let guard = lock(path,true,Duration::from_secs(5))?;
-        ensure!(!path.exists(),"database already exists");
-        ensure!(!sidecar(path,".wal").exists() && !sidecar(path,".head").exists(),"orphan journal or checkpoint exists; recover it before creating a database here");
-        let mut output = tempfile::NamedTempFile::new_in(parent(path))?;
-        output.write_all(&[0; HEADER_BYTES as usize])?;
-        write_header(output.as_file_mut(), &Manifest {
-            archive: archive.to_owned(), tables: vec![], metadata: vec![], id: new_id()?, lsn: 0,
-        })?;
-        output.as_file().sync_all()?;
-        output.persist_noclobber(path)?;
-        sync_parent(path)?;
-        drop(guard);
-        Ok(())
+        Container::create(path, archive, |_| Ok(()))
     }
 
     pub fn open(path: &Path, cache_bytes: usize) -> Result<Self> {
         Self::open_with_timeout(path, cache_bytes, Duration::from_secs(5))
     }
 
-    /// Open, waiting at most `timeout` for a writer that holds the lock.
+    /// Open, waiting at most `timeout` whenever another writer holds the lock.
     pub fn open_with_timeout(path: &Path, cache_bytes: usize, timeout: Duration) -> Result<Self> {
-        ensure!(path.is_file(), "database does not exist: {}", path.display());
-        let guard = lock(path, false, timeout)?;
-        let snapshot = Database::open(path, cache_bytes)?;
-        let lsn = snapshot.manifest.lsn;
-        let mut store = Self { snapshot, path: path.to_owned(), changes: BTreeMap::new(),
-            lsn, valid_wal_bytes: 0, writer: None, pending: vec![], pending_bytes: 0,
-            timeout, stamp: [None, None], workspace_bytes: 32*1024*1024,
-            sync_mode:SyncMode::Always,pending_sync:None,last_relaxed:false,legacy_wal:false, aggregates: HashMap::new(),
-            canonical: std::fs::canonicalize(path)? };
-        store.replay()?;
-        store.stamp = store.disk_stamp()?;
-        drop(guard);
+        Self::open_container(Container::open(path, timeout, false)?, cache_bytes, timeout)
+    }
+
+    /// Open without ever writing, also where the directory is read-only.
+    pub fn open_read_only(path: &Path, cache_bytes: usize) -> Result<Self> {
+        let timeout = Duration::from_secs(5);
+        Self::open_container(Container::open(path, timeout, true)?, cache_bytes, timeout)
+    }
+
+    fn open_container(container: Container, cache_bytes: usize, timeout: Duration) -> Result<Self> {
+        let canonical = container.path.clone();
+        let mut store = Self { snapshot: Database::new(container, cache_bytes), changes: BTreeMap::new(), lsn: 0,
+            writing: false, pending: vec![], pending_bytes: 0, timeout, data_version: 0, workspace_bytes: 32*1024*1024,
+            sync_mode: SyncMode::Always, next_table: 0, aggregates: HashMap::new(), canonical };
+        store.reload()?;
         Ok(store)
     }
 
-    pub fn in_transaction(&self) -> bool { self.writer.is_some() }
+    pub fn in_transaction(&self) -> bool { self.writing }
     pub fn lsn(&self) -> u64 { self.lsn }
     pub fn set_sync_mode(&mut self, mode: SyncMode) -> Result<()> {
-        if matches!(mode,SyncMode::Always) { self.flush()?; }
+        self.snapshot.container.set_synchronous(mode)?;
         self.sync_mode = mode;
         Ok(())
     }
 
+    /// Make committed transactions durable. Only `Background` defers that,
+    /// until a WAL checkpoint.
     pub fn flush(&mut self) -> Result<()> {
-        if let Some((lsn,pending)) = self.pending_sync.take() {
-            pending.join().map_err(|_|anyhow::anyhow!("journal synchronization thread panicked"))??;
-            if lsn >= self.lsn { self.last_relaxed = false; }
-        }
-        if self.last_relaxed {
-            OpenOptions::new().write(true).open(sidecar(&self.path,".wal"))?.sync_data()?;
-            self.last_relaxed = false;
+        if matches!(self.sync_mode, SyncMode::Background) && !self.writing {
+            self.snapshot.container.connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
         }
         Ok(())
     }
@@ -232,221 +166,159 @@ impl Store {
     pub fn set_timeout(&mut self, seconds: f64) -> Result<()> {
         ensure!(seconds.is_finite() && (0.0..=3600.0).contains(&seconds), "invalid lock timeout");
         self.timeout = Duration::from_secs_f64(seconds);
-        Ok(())
+        self.snapshot.container.set_timeout(self.timeout)
     }
 
+    /// Read what other connections committed since the snapshot was taken.
     pub fn refresh(&mut self) -> Result<()> {
         if self.in_transaction() { return Ok(()); }
-        // Every published transaction appends to the journal, and every
-        // checkpoint or vacuum replaces it. An unchanged journal therefore
-        // means unchanged data; an interrupted checkpoint can change only the
-        // main file, without changing what it contains. A writer still inside
-        // its transaction is not visible yet either way, so this check needs
-        // no lock. Writers compare both files in `begin`.
-        if self.journal_stamp()? == self.stamp[1] { return Ok(()); }
-        let guard = lock(&self.path, false, self.timeout)?;
-        if self.disk_stamp()? != self.stamp { self.reload()?; }
-        drop(guard);
-        Ok(())
+        if self.snapshot.container.data_version()? == self.data_version { return Ok(()); }
+        self.reload()
     }
 
+    /// Read the snapshot again: the block index (shared by the process per
+    /// generation) and the changed rows (continued from what this process
+    /// read before, when the generation is the same).
     fn reload(&mut self) -> Result<()> {
         self.aggregates.clear();
-        self.snapshot = Database::open(&self.path, self.snapshot.cache_limit)?;
-        self.lsn = self.snapshot.manifest.lsn;
-        self.changes.clear();
         self.pending.clear();
         self.pending_bytes = 0;
-        self.replay()?;
-        self.stamp = self.disk_stamp()?;
-        Ok(())
+        // Inside a write transaction, the reads include its own uncommitted
+        // writes, which must not reach process-wide state.
+        let committed = !self.writing;
+        if committed { self.snapshot.container.begin_read()?; }
+        let result = self.read_snapshot(committed);
+        if committed { self.snapshot.container.rollback(); }
+        result
     }
 
-    fn disk_stamp(&self) -> Result<Stamp> {
-        Ok([file_stamp(&self.path)?, self.journal_stamp()?])
-    }
-
-    fn journal_stamp(&self) -> Result<Option<(u64, u64, std::time::SystemTime)>> {
-        file_stamp(&sidecar(&self.path, ".wal"))
-    }
-
-    fn replay(&mut self) -> Result<()> {
-        self.last_relaxed = false;
-        self.legacy_wal = false;
-        let path = sidecar(&self.path, ".wal");
-        if !path.exists() { self.valid_wal_bytes = 0; return Ok(()); }
-        let mut input = File::open(path)?;
-        let metadata = input.metadata()?;
-        let length = metadata.len();
-        if length == 0 { self.valid_wal_bytes = 0; return Ok(()); }
-        #[cfg(unix)]
-        let inode = std::os::unix::fs::MetadataExt::ino(&metadata);
-        #[cfg(not(unix))]
-        let inode = 0;
-        let mut magic = [0; 8];
-        input.read_exact(&mut magic).context("truncated journal header")?;
-        self.legacy_wal = &magic == b"WWXWAL02";
-        ensure!(&magic == WAL_MAGIC || self.legacy_wal, "invalid journal format");
-        let mut size = [0; 4];
-        input.read_exact(&mut size)?;
-        let size = u32::from_le_bytes(size) as usize;
-        ensure!(size <= 4096, "invalid journal header size");
-        let mut header = vec![0; size];
-        input.read_exact(&mut header)?;
-        let mut checksum = [0; 4];
-        input.read_exact(&mut checksum)?;
-        ensure!(crc32fast::hash(&header) == u32::from_le_bytes(checksum), "journal header checksum mismatch");
-        let header: WalHeader = serde_json::from_slice(&header)?;
-        ensure!(header.id == self.snapshot.manifest.id && header.base_lsn <= self.lsn, "journal database identity or sequence mismatch");
-        self.valid_wal_bytes = input.stream_position()?;
-        let mut previous = header.base_lsn;
-        // Continue from the state another connection of this process already
-        // replayed. A journal only grows at its inode, so the replayed prefix
-        // is unchanged; a reset journal is a new file.
-        let base = (self.snapshot.manifest.id.clone(), self.snapshot.manifest.lsn, inode, header.base_lsn, self.legacy_wal);
-        if let Some(state) = journals().lock().ok().and_then(|j| j.get(&self.canonical).filter(|s| s.base == base && s.valid <= length).cloned()) {
-            self.changes = state.changes;
-            self.snapshot.manifest = state.manifest;
-            self.lsn = state.lsn;
-            self.last_relaxed = state.last_relaxed;
-            self.aggregates.clear();
-            previous = state.previous;
-            input.seek(SeekFrom::Start(state.valid))?;
-            self.valid_wal_bytes = state.valid;
+    fn read_snapshot(&mut self, committed: bool) -> Result<()> {
+        let meta = self.snapshot.container.meta()?;
+        self.snapshot.load_index(&meta, committed)?;
+        let mut base = None;
+        if committed && let Ok(deltas) = deltas().lock()
+            && let Some(state) = deltas.get(&self.canonical).filter(|s| s.id == meta.uuid && s.generation == meta.generation && s.seq <= meta.seq) {
+            base = Some((state.seq, state.changes.clone()));
         }
-        loop {
-            let offset = input.stream_position()?;
-            if length - offset < 16 { break; }
-            let mut frame = [0; 16];
-            input.read_exact(&mut frame)?;
-            let tagged_size = u32::from_le_bytes(frame[..4].try_into()?);
-            let relaxed = !self.legacy_wal && tagged_size & RELAXED_FRAME != 0;
-            let size = (tagged_size & !RELAXED_FRAME) as usize;
-            let checksum = u32::from_le_bytes(frame[4..8].try_into()?);
-            let lsn = u64::from_le_bytes(frame[8..].try_into()?);
-            ensure!(size > 0 && size <= MAX_FRAME, "invalid journal frame size");
-            if length - input.stream_position()? < size as u64 { break; }
-            let mut data = vec![0; size];
-            input.read_exact(&mut data)?;
-            let mut hash = crc32fast::Hasher::new();
-            if !self.legacy_wal { hash.update(&frame[..4]); }
-            hash.update(&lsn.to_le_bytes()); hash.update(&data);
-            if hash.finalize() != checksum {
-                // Only the newest background commit may be torn after its
-                // acknowledgement. Every later writer syncs its predecessor
-                // before appending another frame, even across processes.
-                if relaxed && input.stream_position()? == length { break; }
-                bail!("journal frame checksum mismatch at {offset}");
+        let (since, mut changes) = base.unwrap_or_default();
+        let rows = self.snapshot.container.load_delta(since)?;
+        let tables: HashMap<u64, usize> = self.snapshot.manifest.tables.iter().enumerate().map(|(i, t)| (t.ordinal, i)).collect();
+        let mut frames: BTreeMap<u64, Vec<crate::changes::Range>> = BTreeMap::new();
+        for (ordinal, time, seq, row) in rows {
+            let table = &self.snapshot.manifest.tables[*tables.get(&ordinal).context("changed row of an unknown table")?];
+            let row = row.map(|mut row| -> Result<Vec<Cell>> {
+                ensure!(row.len() <= table.columns.len(), "changed row of {} has too many cells", table.name);
+                // The row was written before a column was added.
+                for column in &table.columns[row.len()..] { row.push(column.default.clone().unwrap_or(Cell::Null)); }
+                Ok(row)
+            }).transpose()?;
+            Arc::make_mut(changes.entry(table.name.clone()).or_default()).insert(time, row);
+            let ranges = frames.entry(seq).or_default();
+            match ranges.iter_mut().find(|(name, ..)| *name == table.name) {
+                Some(range) => { range.1 = range.1.min(time); range.2 = range.2.max(time); }
+                None => ranges.push((table.name.clone(), time, time)),
             }
-            ensure!(previous.checked_add(1) == Some(lsn), "journal sequence gap");
-            previous = lsn;
-            if lsn > self.snapshot.manifest.lsn {
-                let operations: Vec<Mutation> = serde_json::from_slice(&data)?;
-                crate::changes::record(&self.canonical, &self.snapshot.manifest.id, lsn, touched(&operations));
-                for operation in operations { self.apply(&operation)?; }
-                self.lsn = lsn;
-                self.last_relaxed = relaxed;
-            }
-            self.valid_wal_bytes = input.stream_position()?;
         }
-        if previous < self.snapshot.manifest.lsn { self.valid_wal_bytes = 0; self.last_relaxed = false; return Ok(()); }
-        if let Ok(mut journals) = journals().lock() {
-            journals.insert(self.canonical.clone(), JournalState { base, valid: self.valid_wal_bytes, previous, lsn: self.lsn,
-                last_relaxed: self.last_relaxed, changes: self.changes.clone(), manifest: self.snapshot.manifest.clone() });
+        for (seq, ranges) in frames { crate::changes::record(&self.canonical, &meta.uuid, seq, ranges); }
+        if committed && let Ok(mut deltas) = deltas().lock() {
+            deltas.insert(self.canonical.clone(), DeltaState { id: meta.uuid.clone(), generation: meta.generation, seq: meta.seq, changes: changes.clone() });
         }
+        self.changes = changes;
+        self.lsn = meta.seq;
+        self.data_version = self.snapshot.container.data_version()?;
         Ok(())
-    }
-
-    fn reset_wal(&mut self) -> Result<File> {
-        let mut file = tempfile::NamedTempFile::new_in(parent(&self.path))?;
-        let bytes = serde_json::to_vec(&WalHeader { id: self.snapshot.manifest.id.clone(), base_lsn: self.lsn })?;
-        file.write_all(WAL_MAGIC)?;
-        file.write_all(&(bytes.len() as u32).to_le_bytes())?;
-        file.write_all(&bytes)?;
-        file.write_all(&crc32fast::hash(&bytes).to_le_bytes())?;
-        file.as_file().sync_all()?;
-        let length = file.stream_position()?;
-        file.persist(sidecar(&self.path, ".wal"))?;
-        sync_parent(&self.path)?;
-        self.valid_wal_bytes = length;
-        self.legacy_wal = false;
-        self.last_relaxed = false;
-        Ok(OpenOptions::new().read(true).write(true).open(sidecar(&self.path, ".wal"))?)
     }
 
     pub fn begin(&mut self) -> Result<()> { self.begin_with(false) }
 
     /// Begin a transaction without replacing the snapshot. Open read cursors
     /// hold block positions in it, so neither a reload nor the automatic
-    /// checkpoint may run; the checkpoint waits for a later transaction.
+    /// compaction may run; the compaction waits for a later transaction.
     pub(crate) fn begin_keeping_snapshot(&mut self) -> Result<()> { self.begin_with(true) }
 
     fn begin_with(&mut self, keep_snapshot: bool) -> Result<()> {
         ensure!(!self.in_transaction(), "transaction already active");
-        self.flush()?;
-        let guard = lock(&self.path, true, self.timeout)?;
-        if self.disk_stamp()? != self.stamp {
-            ensure!(!keep_snapshot, "another connection changed the database while a read cursor is open; finish reading before writing");
-            self.reload()?;
+        self.snapshot.container.begin_write()?;
+        self.writing = true;
+        let result = (|| -> Result<()> {
+            let meta = self.snapshot.container.meta()?;
+            if (meta.seq, meta.generation, &meta.uuid) != (self.lsn, self.snapshot.manifest.generation, &self.snapshot.manifest.id) {
+                ensure!(!keep_snapshot, "another connection changed the database while a read cursor is open; finish reading before writing");
+                self.reload()?;
+            }
+            if !keep_snapshot && self.needs_compaction() { self.compact_locked(false)?; }
+            self.next_table = self.snapshot.container.counter("next_table")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.snapshot.container.rollback();
+            self.writing = false;
+            let _ = self.reload();
+            return Err(error);
         }
-        self.flush()?;
-        if self.legacy_wal || (!keep_snapshot && self.valid_wal_bytes >= CHECKPOINT_BYTES) {
-            ensure!(!keep_snapshot, "close read cursors before the first write to a legacy journal");
-            self.checkpoint_locked(false)?;
-        }
-        if self.valid_wal_bytes == 0 { self.reset_wal()?; }
-        let wal = OpenOptions::new().write(true).open(sidecar(&self.path, ".wal"))?;
-        if wal.metadata()?.len() != self.valid_wal_bytes {
-            wal.set_len(self.valid_wal_bytes)?;
-            wal.sync_data()?;
-        }
-        self.writer = Some(guard);
         Ok(())
+    }
+
+    fn needs_compaction(&self) -> bool {
+        let rows: usize = self.changes.values().map(|c| c.len()).sum();
+        rows >= COMPACT_ROWS || self.changes.values().any(|c| c.len() >= COMPACT_TABLE_ROWS)
     }
 
     pub fn commit(&mut self) -> Result<()> {
         ensure!(self.in_transaction(), "no active transaction");
-        if !self.pending.is_empty() {
-            let mut frame = Vec::with_capacity(self.pending_bytes+16);
-            frame.resize(16,0);
-            serde_json::to_writer(&mut frame,&self.pending)?;
-            ensure!(frame.len()-16 <= MAX_FRAME, "transaction exceeds 16 MiB journal limit");
-            let lsn = self.lsn.checked_add(1).context("transaction sequence exhausted")?;
-            let relaxed = matches!(self.sync_mode,SyncMode::Background);
-            let size = ((frame.len()-16) as u32) | if relaxed { RELAXED_FRAME } else { 0 };
-            frame[..4].copy_from_slice(&size.to_le_bytes());
-            frame[8..16].copy_from_slice(&lsn.to_le_bytes());
-            let mut hash = crc32fast::Hasher::new();
-            hash.update(&frame[..4]); hash.update(&frame[8..]);
-            frame[4..8].copy_from_slice(&hash.finalize().to_le_bytes());
-            let mut wal = OpenOptions::new().append(true).open(sidecar(&self.path, ".wal"))?;
-            wal.write_all(&frame)?;
-            if relaxed {
-                let sync_file = wal.try_clone()?;
-                match std::thread::Builder::new().name("weewxdb-sync".into()).stack_size(64*1024).spawn(move||sync_file.sync_data()) {
-                    Ok(worker) => { self.pending_sync = Some((lsn,worker)); self.last_relaxed = true; }
-                    Err(_) => wal.sync_data()?,
-                }
-            } else {
-                // fdatasync persists data and the length needed to retrieve it.
-                // Creation and checkpoint publication also sync the directory.
-                wal.sync_data()?;
-            }
-            self.valid_wal_bytes = wal.metadata()?.len();
-            crate::changes::record(&self.canonical, &self.snapshot.manifest.id, lsn, touched(&self.pending));
-            self.lsn = lsn;
+        let seq = self.lsn.checked_add(1).context("transaction sequence exhausted")?;
+        let written = !self.pending.is_empty();
+        if written { self.write_pending(seq)?; }
+        self.snapshot.container.commit()?;
+        if written {
+            crate::changes::record(&self.canonical, &self.snapshot.manifest.id, seq, touched(&self.pending));
+            self.lsn = seq;
+            Arc::make_mut(&mut self.snapshot.manifest).lsn = seq;
         }
         self.pending.clear(); self.pending_bytes = 0;
-        self.stamp = self.disk_stamp()?;
-        self.writer.take();
+        self.writing = false;
+        Ok(())
+    }
+
+    /// Write the staged mutations as transaction `seq`, in their order.
+    fn write_pending(&mut self, seq: u64) -> Result<()> {
+        let container = &self.snapshot.container;
+        let mut schema = false;
+        for operation in &self.pending {
+            match operation {
+                Mutation::Put { ordinal, time, row, .. } => container.put_delta(*ordinal, *time, seq, row.as_deref())?,
+                Mutation::Create { name, .. } | Mutation::Add { table: name, .. } => {
+                    schema = true;
+                    // The final definition; a later Drop removes it again.
+                    if let Some(table) = self.snapshot.manifest.tables.iter().find(|t| t.name == *name) { container.write_table(table)?; }
+                }
+                Mutation::Metadata { name, .. } => {
+                    if let Some(table) = self.snapshot.manifest.metadata.iter().find(|t| t.name == *name) { container.write_metadata(table)?; }
+                }
+                Mutation::Drop { table, ordinal } => {
+                    schema = true;
+                    match ordinal {
+                        Some(ordinal) => container.drop_table(*ordinal, self.snapshot.manifest.generation + 1)?,
+                        None => container.drop_metadata(table)?,
+                    }
+                }
+            }
+        }
+        if schema {
+            let generation = self.snapshot.manifest.generation + 1;
+            container.set_counter("generation", generation)?;
+            Arc::make_mut(&mut self.snapshot.manifest).generation = generation;
+        }
+        container.set_counter("next_table", self.next_table)?;
+        container.set_counter("seq", seq)?;
         Ok(())
     }
 
     pub fn rollback(&mut self) -> Result<()> {
         ensure!(self.in_transaction(), "no active transaction");
-        let result = self.reload();
-        self.writer.take();
-        result
+        self.snapshot.container.rollback();
+        self.writing = false;
+        self.reload()
     }
 
     pub(crate) fn savepoint(&self) -> usize { self.pending.len() }
@@ -460,8 +332,8 @@ impl Store {
 
     fn stage(&mut self, operation: Mutation) -> Result<()> {
         ensure!(self.in_transaction(), "writes require a transaction");
-        let size = serde_json::to_vec(&operation)?.len() + 1;
-        ensure!(self.pending_bytes + size + 2 <= MAX_FRAME, "transaction exceeds 16 MiB journal limit; use smaller batches");
+        let size = operation.bytes();
+        ensure!(self.pending_bytes + size <= MAX_TRANSACTION_BYTES, "transaction exceeds 256 MiB; use smaller batches");
         self.apply(&operation)?;
         self.pending_bytes += size;
         self.pending.push(operation);
@@ -471,13 +343,13 @@ impl Store {
     fn apply(&mut self, operation: &Mutation) -> Result<()> {
         self.aggregates.clear();
         match operation {
-            Mutation::Put { table, time, row } => {
+            Mutation::Put { table, time, row, .. } => {
                 self.table_index(table)?;
                 Arc::make_mut(self.changes.entry(table.clone()).or_default()).insert(*time, row.clone());
             }
-            Mutation::Create { name, sql, columns } => {
+            Mutation::Create { name, sql, columns, ordinal } => {
                 ensure!(!self.tables().contains(name), "table already exists: {name}");
-                Arc::make_mut(&mut self.snapshot.manifest).tables.push(Table { name: name.clone(), sql: sql.clone(), columns: columns.clone(), blocks: vec![], rows: 0 });
+                tables_mut(&mut self.snapshot.manifest).push(Table { ordinal: *ordinal, name: name.clone(), sql: sql.clone(), columns: columns.clone(), blocks: vec![], rows: 0 });
             }
             Mutation::Metadata { name, sql, rows } => {
                 Arc::make_mut(&mut self.snapshot.manifest).metadata.retain(|t| t.name != *name);
@@ -486,14 +358,14 @@ impl Store {
             Mutation::Add { table, column, sql } => {
                 let ti = self.table_index(table)?;
                 ensure!(!self.snapshot.manifest.tables[ti].columns.iter().any(|c| c.name.eq_ignore_ascii_case(&column.name)), "duplicate column {}", column.name);
-                Arc::make_mut(&mut self.snapshot.manifest).tables[ti].columns.push(column.clone());
-                Arc::make_mut(&mut self.snapshot.manifest).tables[ti].sql = sql.clone();
+                tables_mut(&mut self.snapshot.manifest)[ti].columns.push(column.clone());
+                tables_mut(&mut self.snapshot.manifest)[ti].sql = sql.clone();
                 if let Some(changes) = self.changes.get_mut(table) {
                     for row in Arc::make_mut(changes).values_mut().flatten() { row.push(column.default.clone().unwrap_or(Cell::Null)); }
                 }
             }
-            Mutation::Drop { table } => {
-                Arc::make_mut(&mut self.snapshot.manifest).tables.retain(|t| t.name != *table);
+            Mutation::Drop { table, .. } => {
+                tables_mut(&mut self.snapshot.manifest).retain(|t| t.name != *table);
                 Arc::make_mut(&mut self.snapshot.manifest).metadata.retain(|t| t.name != *table);
                 self.changes.remove(table);
             }
@@ -521,10 +393,15 @@ impl Store {
 
     pub fn create_table(&mut self, name: &str, sql: &str, columns: Vec<Column>) -> Result<()> {
         ensure!(columns.iter().any(|c| c.name == "dateTime" && c.kind == Kind::Integer), "numeric tables require an INTEGER dateTime primary key");
-        self.stage(Mutation::Create { name: name.to_owned(), sql: sql.to_owned(), columns })
+        crate::container::validate_definition(sql, name)?;
+        let ordinal = self.next_table;
+        self.stage(Mutation::Create { name: name.to_owned(), sql: sql.to_owned(), columns, ordinal })?;
+        self.next_table += 1;
+        Ok(())
     }
 
     pub fn replace_metadata(&mut self, name: &str, sql: &str, rows: Vec<Vec<Cell>>) -> Result<()> {
+        crate::container::validate_definition(sql, name)?;
         self.stage(Mutation::Metadata { name: name.to_owned(), sql: sql.to_owned(), rows })
     }
 
@@ -536,7 +413,8 @@ impl Store {
 
     pub fn drop_table(&mut self, table: &str) -> Result<()> {
         ensure!(self.tables().contains(&table.to_owned()), "no such table: {table}");
-        self.stage(Mutation::Drop { table: table.to_owned() })
+        let ordinal = self.snapshot.manifest.tables.iter().find(|t| t.name == table).map(|t| t.ordinal);
+        self.stage(Mutation::Drop { table: table.to_owned(), ordinal })
     }
 
     pub fn put(&mut self, table: &str, row: Vec<Cell>, replace: bool) -> Result<i64> {
@@ -544,16 +422,23 @@ impl Store {
         ensure!(row.len() == columns.len(), "wrong column count");
         let mut normalized = Vec::with_capacity(row.len());
         for (column, cell) in columns.iter().zip(row) {
-            let cell = numeric_cell(column.kind,cell);
+            // A virtual table receives NULL for a column the INSERT omits.
+            // A NOT NULL column with a default takes the default, as SQLite
+            // does for an omitted column.
+            let cell = match (cell, &column.default) {
+                (Cell::Null, Some(default)) if column.not_null => default.clone(),
+                (cell, _) => numeric_cell(column.kind, cell),
+            };
             validate_cell(column, &cell)?;
             normalized.push(cell);
         }
         let index = columns.iter().position(|c| c.name == "dateTime").unwrap();
         let Cell::Integer(time) = normalized[index] else { bail!("dateTime must be an integer") };
-        let table = self.snapshot.manifest.tables[self.table_index(table)?].name.clone();
+        let ti = self.table_index(table)?;
+        let (table, ordinal) = (self.snapshot.manifest.tables[ti].name.clone(), self.snapshot.manifest.tables[ti].ordinal);
         let table = table.as_str();
         ensure!(replace || self.get(table, time)?.is_none(), "UNIQUE constraint failed: {table}.dateTime");
-        self.stage(Mutation::Put { table: table.to_owned(), time, row: Some(normalized) })?;
+        self.stage(Mutation::Put { table: table.to_owned(), ordinal, time, row: Some(normalized) })?;
         Ok(time)
     }
 
@@ -567,7 +452,8 @@ impl Store {
     }
 
     pub fn delete(&mut self, table: &str, time: i64) -> Result<()> {
-        self.stage(Mutation::Put { table: table.to_owned(), time, row: None })
+        let ordinal = self.snapshot.manifest.tables[self.table_index(table)?].ordinal;
+        self.stage(Mutation::Put { table: table.to_owned(), ordinal, time, row: None })
     }
 
     pub fn get(&mut self, table: &str, time: i64) -> Result<Option<Vec<Cell>>> {
@@ -749,147 +635,184 @@ impl Store {
                 if reverse { info.last = edge; } else { info.first = edge; }
             }
         }
-        Ok(StoreInfo { snapshot: info, lsn: self.lsn, journal_bytes: self.valid_wal_bytes,
+        let pragma = |name: &str| -> Result<u64> {
+            Ok(self.snapshot.container.connection.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))? as u64)
+        };
+        let page = pragma("page_size")?;
+        Ok(StoreInfo { snapshot: info, format_version: crate::container::FORMAT_VERSION, lsn: self.lsn,
+            generation: self.snapshot.manifest.generation,
             changed_rows: self.changes.values().map(|c| c.len()).sum(),
             indexed_columns: self.snapshot.manifest.tables.iter().map(|t| t.columns.len()).sum(),
             summarized_blocks: self.snapshot.manifest.tables.iter().flat_map(|t| &t.blocks)
-                .flat_map(|b| &b.columns).filter(|c| c.stats.is_some()).count() })
+                .flat_map(|b| &b.columns).filter(|c| c.stats.is_some()).count(),
+            file_bytes: pragma("page_count")? * page, free_bytes: pragma("freelist_count")? * page })
     }
 
+    /// Fold all changed rows into blocks now. `rebuild_stats` also recomputes
+    /// the summaries of unchanged blocks.
     pub fn checkpoint(&mut self, rebuild_stats: bool) -> Result<()> {
         ensure!(!self.in_transaction(), "checkpoint cannot run inside a transaction");
-        self.flush()?;
-        let guard = lock(&self.path, true, self.timeout)?;
-        self.reload()?;
-        let result = self.checkpoint_locked(rebuild_stats);
-        drop(guard);
-        result
+        self.begin()?;
+        if let Err(error) = self.compact_locked(rebuild_stats) {
+            let _ = self.rollback();
+            return Err(error);
+        }
+        self.commit()
     }
 
-    fn checkpoint_locked(&mut self, rebuild_stats: bool) -> Result<()> {
+    /// Fold the changed rows into blocks inside the current write
+    /// transaction. Only blocks with changes, and the last block of a table
+    /// when rows follow it, are rewritten; new rows fill the last block up to
+    /// its capacity before a new block starts. Replaced chunks become garbage
+    /// of the new generation and are deleted one compaction later.
+    fn compact_locked(&mut self, rebuild_stats: bool) -> Result<()> {
+        let generation = self.snapshot.manifest.generation + 1;
+        let seq = self.lsn.checked_add(1).context("transaction sequence exhausted")?;
+        let mut next_chunk = self.snapshot.container.counter("next_chunk")?;
         let mut manifest = (*self.snapshot.manifest).clone();
-        // Even an index-only optimization publishes a newer sequence number,
-        // so an interrupted publication cannot make a reader select old data.
-        manifest.lsn = self.lsn.checked_add(1).context("transaction sequence exhausted")?;
-        let mut output = OpenOptions::new().read(true).append(true).open(&self.path)?;
-        for (ti, table) in manifest.tables.iter_mut().enumerate() {
-            let mut blocks = Vec::new();
-            let mut lower = std::ops::Bound::Unbounded;
+        let mut tables = (*manifest.tables).clone();
+        let mut garbage = Vec::new();
+        for (ti, table) in tables.iter_mut().enumerate() {
             let changes = self.changes.get(&table.name).cloned().unwrap_or_default();
-            for bi in 0..table.blocks.len() {
-                let block = &table.blocks[bi];
-                let changed = changes.range((lower, std::ops::Bound::Included(block.last))).collect::<Vec<_>>();
-                if changed.is_empty() && block.rows <= rows_per_block(&table.name) {
-                    let mut block = block.clone();
+            if changes.is_empty() && !rebuild_stats { continue; }
+            let limit = rows_per_block(&table.name);
+            let ts = table.columns.iter().position(|c| c.name == "dateTime").unwrap();
+            let count = table.blocks.len();
+            let mut blocks = Vec::with_capacity(count + 1);
+            let mut lower = std::ops::Bound::Unbounded;
+            for bi in 0..count {
+                let block = table.blocks[bi].clone();
+                // Rows after the last block go into it while it has room.
+                let absorbs_tail = bi + 1 == count && block.rows < limit;
+                let upper = if absorbs_tail { std::ops::Bound::Unbounded } else { std::ops::Bound::Included(block.last) };
+                let changed = changes.range((lower, upper)).collect::<Vec<_>>();
+                lower = match changes.keys().next_back() {
+                    Some(&newest) if absorbs_tail => std::ops::Bound::Excluded(newest.max(block.last)),
+                    _ => std::ops::Bound::Excluded(block.last),
+                };
+                if changed.is_empty() {
+                    let mut block = block;
                     if rebuild_stats {
-                        for (ci,column) in block.columns.iter_mut().enumerate() {
-                            let bytes = self.snapshot.load(ti,bi,ci)?;
+                        for (ci, column) in block.columns.iter_mut().enumerate() {
+                            let bytes = self.snapshot.load(ti, bi, ci)?;
                             let mut stats = Accumulator::default();
-                            for ri in 0..block.rows { stats.add(number(&bytes,block.rows,ri,table.columns[ci].kind)); }
+                            for ri in 0..block.rows { stats.add(number(&bytes, block.rows, ri, table.columns[ci].kind)); }
                             column.stats = Some(stats.finish());
                         }
                     }
                     blocks.push(block);
-                } else {
-                    let mut rows = BTreeMap::new();
-                    let ts = table.columns.iter().position(|c| c.name == "dateTime").unwrap();
-                    for row in self.read_block(ti, bi)? {
-                        let Cell::Integer(time) = row[ts] else { bail!("invalid timestamp") };
-                        rows.insert(time, row);
-                    }
-                    for (&time, row) in changed { match row { Some(row) => { rows.insert(time, row.clone()); }, None => { rows.remove(&time); } } }
-                    append_rows(&mut output, &table.columns, rows.into_values(), &mut blocks,rows_per_block(&table.name))?;
+                    continue;
                 }
-                lower = std::ops::Bound::Excluded(block.last);
+                let mut rows = BTreeMap::new();
+                for row in self.read_block(ti, bi)? {
+                    let Cell::Integer(time) = row[ts] else { bail!("invalid timestamp") };
+                    rows.insert(time, row);
+                }
+                for (&time, row) in changed { match row { Some(row) => { rows.insert(time, row.clone()); }, None => { rows.remove(&time); } } }
+                garbage.extend(block.columns.iter().filter(|c| c.chunk > 0).map(|c| c.chunk));
+                let rows = rows.into_values().collect::<Vec<_>>();
+                for batch in rows.chunks(limit) { write_block(&self.snapshot.container, &mut next_chunk, &table.columns, batch, &mut blocks)?; }
             }
-            let tail = changes.range((lower, std::ops::Bound::Unbounded)).filter_map(|(_, row)| row.clone());
-            append_rows(&mut output, &table.columns, tail, &mut blocks,rows_per_block(&table.name))?;
+            let tail = changes.range((lower, std::ops::Bound::Unbounded)).filter_map(|(_, row)| row.clone()).collect::<Vec<_>>();
+            for batch in tail.chunks(limit) { write_block(&self.snapshot.container, &mut next_chunk, &table.columns, batch, &mut blocks)?; }
+            // Summaries rebuilt in place keep their chunks, so every row is written.
+            let old = if rebuild_stats { &[][..] } else { &table.blocks[..] };
+            self.snapshot.container.write_blocks(table.ordinal, old, &blocks)?;
             table.rows = blocks.iter().map(|b| b.rows as u64).sum();
             table.blocks = blocks;
         }
-        let bytes = serde_json::to_vec(&manifest)?;
-        ensure!(bytes.len() as u64 <= MAX_MANIFEST_BYTES, "index size limit exceeded");
-        let offset = output.seek(SeekFrom::End(0))?;
-        output.write_all(&bytes)?;
-        output.sync_all()?;
-        let head = Head { id: manifest.id.clone(), lsn: manifest.lsn, offset,
-            length: bytes.len() as u64, checksum: crc32fast::hash(&bytes) };
-        let bytes = serde_json::to_vec(&head)?;
-        let mut pointer = tempfile::NamedTempFile::new_in(parent(&self.path))?;
-        pointer.write_all(&crc32fast::hash(&bytes).to_le_bytes())?;
-        pointer.write_all(&bytes)?;
-        pointer.as_file().sync_all()?;
-        pointer.persist(sidecar(&self.path, ".head"))?;
-        sync_parent(&self.path)?;
-        self.lsn = manifest.lsn;
-        // A checkpoint republishes the same data under a new sequence number.
-        crate::changes::record(&self.canonical, &manifest.id, manifest.lsn, vec![]);
-        self.snapshot = Database::open(&self.path, self.snapshot.cache_limit)?;
+        let container = &self.snapshot.container;
+        container.discard(&garbage, generation)?;
+        container.purge(generation - 1)?;
+        container.clear_delta()?;
+        container.set_counter("next_chunk", next_chunk)?;
+        container.set_counter("generation", generation)?;
+        container.set_counter("seq", seq)?;
+        manifest.tables = Arc::new(tables);
+        manifest.generation = generation;
+        manifest.lsn = seq;
+        self.snapshot.manifest = Arc::new(manifest);
         self.changes.clear();
         self.aggregates.clear();
-        self.reset_wal()?;
-        self.stamp = self.disk_stamp()?;
+        self.lsn = seq;
+        // A compaction republishes the same rows under a new sequence number.
+        crate::changes::record(&self.canonical, &self.snapshot.manifest.id, seq, vec![]);
         Ok(())
     }
 
+    /// Check the file and every block: SQLite's structure, each chunk's
+    /// checksum and length, timestamps that are present, ordered and inside
+    /// their block's bounds, and the stored summaries.
     pub fn verify(&mut self) -> Result<()> {
+        let problems: Vec<String> = self.snapshot.container.connection.prepare("PRAGMA integrity_check")?
+            .query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<_>>()?;
+        ensure!(problems == ["ok"], "file structure damaged: {}", problems.join("; "));
         for ti in 0..self.snapshot.manifest.tables.len() {
-            for bi in 0..self.snapshot.manifest.tables[ti].blocks.len() {
-                for ci in 0..self.snapshot.manifest.tables[ti].columns.len() { self.snapshot.load(ti,bi,ci)?; }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn vacuum(&mut self) -> Result<()> {
-        ensure!(!self.in_transaction(), "vacuum cannot run inside a transaction");
-        let guard = lock(&self.path,true,self.timeout)?;
-        self.reload()?;
-        self.checkpoint_locked(false)?;
-        let mut manifest = (*self.snapshot.manifest).clone();
-        manifest.lsn = self.lsn.checked_add(1).context("transaction sequence exhausted")?;
-        let mut output = tempfile::NamedTempFile::new_in(parent(&self.path))?;
-        output.write_all(&[0; HEADER_BYTES as usize])?;
-        for (ti,table) in manifest.tables.iter_mut().enumerate() {
-            for (bi,block) in table.blocks.iter_mut().enumerate() {
-                for (ci,column) in block.columns.iter_mut().enumerate() {
-                    let offset = output.stream_position()?;
-                    if column.length > 0 {
-                        self.snapshot.load(ti,bi,ci)?;
-                        let original = &self.snapshot.manifest.tables[ti].blocks[bi].columns[ci];
-                        self.snapshot.file.seek(SeekFrom::Start(original.offset))?;
-                        let mut bytes = vec![0;original.length];
-                        self.snapshot.file.read_exact(&mut bytes)?;
-                        output.write_all(&bytes)?;
-                    }
-                    column.offset = offset;
+            let table = self.snapshot.manifest.tables[ti].clone();
+            let ts = table.columns.iter().position(|c| c.name == "dateTime").unwrap();
+            for (bi, block) in table.blocks.iter().enumerate() {
+                let times = self.snapshot.load(ti, bi, ts)?;
+                let mut previous = None;
+                for ri in 0..block.rows {
+                    let time = bits(&times, block.rows, ri).map(|t| t as i64)
+                        .with_context(|| format!("{}: NULL dateTime in block {}", table.name, block.first))?;
+                    ensure!(previous.is_none_or(|p| time > p) && (block.first..=block.last).contains(&time),
+                        "{}: dateTime {time} out of order in block {}", table.name, block.first);
+                    previous = Some(time);
+                }
+                for ci in 0..table.columns.len() {
+                    let bytes = self.snapshot.load(ti, bi, ci)?;
+                    let Some(stored) = block.columns.get(ci).and_then(|c| c.stats.clone()) else { continue };
+                    let mut stats = Accumulator::default();
+                    for ri in 0..block.rows { stats.add(number(&bytes, block.rows, ri, table.columns[ci].kind)); }
+                    let stats = stats.finish();
+                    ensure!(stats.count == stored.count && stats.min.map(f64::to_bits) == stored.min.map(f64::to_bits)
+                        && stats.max.map(f64::to_bits) == stored.max.map(f64::to_bits),
+                        "{}.{}: summary of block {} does not match its values", table.name, table.columns[ci].name, block.first);
                 }
             }
         }
-        write_header(output.as_file_mut(),&manifest)?;
-        output.as_file().sync_all()?;
-        output.persist(&self.path)?;
-        sync_parent(&self.path)?;
-        // The newer base LSN makes an old pointer harmless if a crash happens
-        // between replacing the data file and removing that pointer.
-        std::fs::remove_file(sidecar(&self.path,".head"))?;
-        self.snapshot = Database::open(&self.path,self.snapshot.cache_limit)?;
-        self.aggregates.clear();
-        self.lsn = manifest.lsn;
-        crate::changes::record(&self.canonical, &manifest.id, manifest.lsn, vec![]);
-        self.reset_wal()?;
-        self.stamp = self.disk_stamp()?;
-        drop(guard);
         Ok(())
     }
 
+    /// Compact, delete all garbage and let SQLite rebuild the file without
+    /// free pages. Readers in other processes that still hold an older index
+    /// fail their current query and succeed on the next.
+    pub fn vacuum(&mut self) -> Result<()> {
+        ensure!(!self.in_transaction(), "vacuum cannot run inside a transaction");
+        self.begin()?;
+        let result = self.compact_locked(false).and_then(|_| self.snapshot.container.purge(i64::MAX as u64));
+        if let Err(error) = result { let _ = self.rollback(); return Err(error); }
+        self.commit()?;
+        self.snapshot.container.connection.execute_batch("VACUUM")?;
+        self.reload()
+    }
+
+    /// Write a consistent copy of the committed database to `destination`,
+    /// which must not exist. Works while other connections write.
+    pub fn backup(&mut self, destination: &Path) -> Result<()> {
+        ensure!(!self.in_transaction(), "backup cannot run inside a transaction");
+        let destination = crate::container::resolve(destination)?;
+        ensure!(!destination.exists(), "destination must not already exist: {}", destination.display());
+        let temporary = sidecar(&destination, &format!(".tmp-{}", new_id()?));
+        let result = (|| -> Result<()> {
+            self.snapshot.container.connection.execute("VACUUM INTO ?", [temporary.to_string_lossy()])?;
+            File::open(&temporary)?.sync_all()?;
+            std::fs::hard_link(&temporary, &destination).with_context(|| format!("destination must not already exist: {}", destination.display()))?;
+            std::fs::remove_file(&temporary)?;
+            crate::container::sync_directory(&destination)
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+        result
+    }
+
     pub fn export_sqlite(&mut self, destination: &Path) -> Result<()> {
-        let output = tempfile::NamedTempFile::new_in(parent(destination))?;
+        let output = tempfile::NamedTempFile::new_in(destination.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
         {
             let mut connection = Connection::open(output.path())?;
             let transaction = connection.transaction()?;
             let manifest = self.snapshot.manifest.clone();
-            for table in &manifest.tables {
+            for table in manifest.tables.iter() {
                 transaction.execute_batch(&table.sql)?;
                 let mut insert = transaction.prepare(&format!("INSERT INTO {} VALUES ({})",quote(&table.name),vec!["?";table.columns.len()].join(",")))?;
                 let mut cursor = RowCursor::new_bounds(self,&table.name,None,None)?;
@@ -906,42 +829,24 @@ impl Store {
             }
             transaction.commit()?;
         }
-        output.as_file().sync_all()?;
-        output.persist_noclobber(destination)?;
-        sync_parent(destination)
+        crate::publish_file(output, destination)
     }
 }
 
-impl Drop for Store {
-    fn drop(&mut self) { let _ = self.flush(); }
-}
-
-/// A replayed journal: the published snapshot and journal it starts from,
-/// how far it was read, and the resulting rows and schema.
+/// Changed rows a process has read for one database, shared by its new
+/// connections. They continue from here instead of reading every changed
+/// row again, while the generation is the same.
 #[derive(Clone)]
-struct JournalState {
-    /// Database id and snapshot sequence, journal inode, journal base
-    /// sequence and whether the journal has the legacy format.
-    base: (String, u64, u64, u64, bool),
-    valid: u64,
-    previous: u64,
-    lsn: u64,
-    last_relaxed: bool,
+struct DeltaState {
+    id: String,
+    generation: u64,
+    seq: u64,
     changes: Changes,
-    manifest: Arc<Manifest>,
 }
 
-/// Forget the replayed journal this process keeps for `path`, as a new
-/// process would. Frames are verified once per process; tests use this to
-/// check how a fresh process treats a damaged journal.
-#[doc(hidden)]
-pub fn forget_replayed_journal(path: &Path) {
-    if let (Ok(path), Ok(mut journals)) = (std::fs::canonicalize(path), journals().lock()) { journals.remove(&path); }
-}
-
-fn journals() -> &'static std::sync::Mutex<HashMap<PathBuf, JournalState>> {
-    static JOURNALS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, JournalState>>> = std::sync::OnceLock::new();
-    JOURNALS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+fn deltas() -> &'static std::sync::Mutex<HashMap<PathBuf, DeltaState>> {
+    static DELTAS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, DeltaState>>> = std::sync::OnceLock::new();
+    DELTAS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 /// The tables and time ranges a transaction's mutations change.
@@ -951,7 +856,7 @@ fn touched(operations: &[Mutation]) -> Vec<crate::changes::Range> {
         let (table, first, last) = match operation {
             Mutation::Put { table, time, .. } => (table, *time, *time),
             Mutation::Create { name, .. } | Mutation::Metadata { name, .. } => (name, i64::MIN, i64::MAX),
-            Mutation::Add { table, .. } | Mutation::Drop { table } => (table, i64::MIN, i64::MAX),
+            Mutation::Add { table, .. } | Mutation::Drop { table, .. } => (table, i64::MIN, i64::MAX),
         };
         match ranges.iter_mut().find(|(name, ..)| name == table) {
             Some(range) => { range.1 = range.1.min(first); range.2 = range.2.max(last); }
@@ -969,39 +874,39 @@ impl Store {
     }
 }
 
-fn validate_cell(column: &Column, value: &Cell) -> Result<()> {
+/// Accept what a numeric SQLite column would store as a number: INTEGER
+/// columns also hold REAL values, and REAL values may be infinite. NaN
+/// arrives as NULL, as SQLite binds it.
+pub(crate) fn validate_cell(column: &Column, value: &Cell) -> Result<()> {
     ensure!(!column.not_null || *value != Cell::Null, "NOT NULL constraint failed: {}", column.name);
-    ensure!(matches!((column.kind, value), (_, Cell::Null) | (Kind::Integer, Cell::Integer(_)))
-        || matches!((column.kind, value), (Kind::Real, Cell::Real(bits)) if f64::from_bits(*bits).is_finite()), "invalid value for {}", column.name);
+    ensure!(!matches!(value, Cell::Text(_) | Cell::Blob(_)), "datatype mismatch: {} holds numbers", column.name);
+    ensure!(column.name != "dateTime" || matches!(value, Cell::Integer(_)), "datatype mismatch: dateTime must be an integer");
     Ok(())
 }
 
-fn decode(bytes: &[u8], rows: usize, ri: usize, kind: Kind) -> Cell {
-    match bits(bytes, rows, ri) { None => Cell::Null, Some(n) => match kind {
-        Kind::Integer => Cell::Integer(n as i64), Kind::Real => Cell::Real(n),
-    } }
-}
+fn decode(bytes: &[u8], rows: usize, ri: usize, kind: Kind) -> Cell { cell_at(bytes, rows, ri, kind) }
 
-fn append_rows(output: &mut File, columns: &[Column], rows: impl Iterator<Item=Vec<Cell>>, blocks: &mut Vec<Block>,limit: usize) -> Result<()> {
-    let mut rows = rows.peekable();
+fn tables_mut(manifest: &mut Arc<Manifest>) -> &mut Vec<Table> { Arc::make_mut(&mut Arc::make_mut(manifest).tables) }
+
+/// Encode `rows` as one block, store its chunks and append it to `blocks`.
+pub(crate) fn write_block(container: &Container, next_chunk: &mut u64, columns: &[Column], rows: &[Vec<Cell>], blocks: &mut Vec<Block>) -> Result<()> {
     let ts = columns.iter().position(|c| c.name == "dateTime").context("dateTime missing")?;
-    while rows.peek().is_some() {
-        let rows = rows.by_ref().take(limit).collect::<Vec<_>>();
-        let times = rows.iter().map(|r| match r[ts] { Cell::Integer(n) => Ok(n), _ => bail!("invalid timestamp") }).collect::<Result<Vec<_>>>()?;
-        let mut block = Block { rows: rows.len(), first: times[0], last: *times.last().unwrap(), columns: vec![] };
-        for (ci, column) in columns.iter().enumerate() {
-            let values = rows.iter().map(|row| match &row[ci] {
-                Cell::Null => None, Cell::Integer(n) => Some(*n as u64), Cell::Real(n) => Some(*n), _ => unreachable!(),
-            }).collect::<Vec<_>>();
-            let mut stats = Accumulator::default();
-            for value in &values { stats.add(value.map(|v| match column.kind { Kind::Integer => (v as i64) as f64, Kind::Real => f64::from_bits(v) })); }
-            let (bytes,compressed) = stored_column(&values);
-            let offset = output.seek(SeekFrom::End(0))?;
-            output.write_all(&bytes)?;
-            block.columns.push(ColumnBlock { offset, length: bytes.len(), checksum: crc32fast::hash(&bytes), stats: Some(stats.finish()), compressed });
-        }
-        blocks.push(block);
+    let times = rows.iter().map(|r| match r[ts] { Cell::Integer(n) => Ok(n), _ => bail!("invalid timestamp") }).collect::<Result<Vec<_>>>()?;
+    let mut block = Block { rows: rows.len(), first: times[0], last: *times.last().unwrap(), columns: Vec::with_capacity(columns.len()) };
+    for (ci, column) in columns.iter().enumerate() {
+        let cells: Vec<&Cell> = rows.iter().map(|row| &row[ci]).collect();
+        let mut stats = Accumulator::default();
+        for cell in &cells { stats.add(cell.numeric()); }
+        let (bytes, compressed) = stored_column(encode_cells(column.kind, &cells)?);
+        let chunk = if bytes.is_empty() { 0 } else {
+            let id = *next_chunk;
+            *next_chunk += 1;
+            container.write_chunk(id, &bytes)?;
+            id
+        };
+        block.columns.push(ColumnBlock { chunk, length: bytes.len(), checksum: crc32fast::hash(&bytes), stats: Some(stats.finish()), compressed });
     }
+    blocks.push(block);
     Ok(())
 }
 

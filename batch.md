@@ -79,8 +79,8 @@ can therefore differ from a daily minimum that includes LOOP packets.
 ## Report cache
 
 `ReportCache(max_bytes=8 * 1024 * 1024)` stores bounded result payloads for one
-report instance. The cache tracks the native snapshot identifier and journal
-revision. Committed changes through other connections and checkpoints invalidate
+report instance. The cache tracks the database identity and its last
+transaction number. Committed changes through other connections and checkpoints invalidate
 cached results. Explicit transactions disable caching. Query settings form part
 of the key; custom XType dispatch is checked before each lookup. Rain rate,
 delta and pressure queries bypass this cache because they carry mutable provider

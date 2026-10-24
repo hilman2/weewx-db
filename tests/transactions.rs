@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use weewx_db::{Cell, Kind, Column, Span};
-use weewx_db::store::{Store, sidecar};
+use weewx_db::store::Store;
 use weewx_db::sql::Session;
 
 fn database(path: &Path) -> Session {
     Store::create(path, "archive").unwrap();
     let mut session = Session::open(path, 8192).unwrap();
+    session.set_sync_mode(weewx_db::store::SyncMode::Background).unwrap();
     session.execute("CREATE TABLE archive(dateTime INTEGER NOT NULL PRIMARY KEY, outTemp REAL, interval INTEGER DEFAULT 5)", &[]).unwrap();
     session
 }
@@ -41,30 +42,6 @@ fn sql_transactions_rollback_failed_statements_and_reopen() {
 }
 
 #[test]
-fn journal_tail_is_recovered_but_complete_corruption_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("live.wwdb");
-    let mut session = database(&path);
-    session.execute("INSERT INTO archive VALUES (300, 12.0, 5)", &[]).unwrap();
-    let good = std::fs::read(sidecar(&path,".wal")).unwrap();
-    session.execute("INSERT INTO archive VALUES (600, 7.0, 5)", &[]).unwrap();
-    let complete = std::fs::read(sidecar(&path,".wal")).unwrap();
-    drop(session);
-    for tail in [1, 7, 15, complete.len()-good.len()-1] {
-        std::fs::write(sidecar(&path,".wal"), &complete[..good.len()+tail]).unwrap();
-        let mut session = Session::open(&path,0).unwrap();
-        assert_eq!(scalar(&mut session,"SELECT COUNT(*) FROM archive"),Cell::Integer(1));
-        session.execute("INSERT INTO archive VALUES (900, 3.0, 5)", &[]).unwrap();
-        assert_eq!(scalar(&mut session,"SELECT COUNT(*) FROM archive"),Cell::Integer(2));
-    }
-    let mut corrupt = complete;
-    let end = corrupt.len()-1;
-    corrupt[end] ^= 1;
-    std::fs::write(sidecar(&path,".wal"),corrupt).unwrap();
-    assert!(Session::open(&path,0).is_err());
-}
-
-#[test]
 fn schema_addition_is_durable_and_does_not_rewrite_old_payloads() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("live.wwdb");
@@ -82,26 +59,6 @@ fn schema_addition_is_durable_and_does_not_rewrite_old_payloads() {
     let mut reopened = Session::open(&path,0).unwrap();
     assert_eq!(scalar(&mut reopened,"SELECT pm25 FROM archive WHERE dateTime=300"),Cell::Real(7.5f64.to_bits()));
     assert_eq!(scalar(&mut reopened,"SELECT COUNT(humidity) FROM archive"),Cell::Integer(0));
-}
-
-#[test]
-fn checkpoint_publication_survives_an_old_journal_and_unpublished_tail() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("live.wwdb");
-    let mut session = database(&path);
-    session.execute("INSERT INTO archive VALUES (300, 12.0, 5)", &[]).unwrap();
-    let old_wal = std::fs::read(sidecar(&path,".wal")).unwrap();
-    session.checkpoint(false).unwrap();
-    std::fs::write(sidecar(&path,".wal"),old_wal).unwrap();
-    drop(session);
-    let mut reopened = Session::open(&path,0).unwrap();
-    reopened.execute("INSERT INTO archive VALUES (600, 7.0, 5)", &[]).unwrap();
-    assert_eq!(scalar(&mut reopened,"SELECT COUNT(*) FROM archive"),Cell::Integer(2));
-    drop(reopened);
-    use std::io::Write;
-    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"unpublished checkpoint bytes").unwrap();
-    let mut reopened = Session::open(&path,0).unwrap();
-    assert_eq!(scalar(&mut reopened,"SELECT COUNT(*) FROM archive"),Cell::Integer(2));
 }
 
 #[test]
@@ -231,7 +188,7 @@ fn comments_transactions_workspace_and_large_integers() {
     session.execute("INSERT INTO archive VALUES (1000000,2,5,1)",&[]).unwrap();
     session.execute("UPDATE archive SET interval=5.0 WHERE dateTime=1000000",&[]).unwrap();
     assert_eq!(scalar(&mut session,"SELECT interval FROM archive WHERE dateTime=1000000"),Cell::Integer(5));
-    assert!(session.execute("UPDATE archive SET interval=5.5 WHERE dateTime=1000000",&[]).is_err());
+    session.execute("UPDATE archive SET interval=5.5 WHERE dateTime=1000000",&[]).unwrap();
     assert_eq!(scalar(&mut session,"SELECT COUNT(OUTTEMP) FROM ARCHIVE WHERE DATETIME=1000000"),Cell::Integer(1));
     assert!(session.execute("SELECT SUM(counter) FROM archive",&[]).unwrap_err().to_string().contains("overflow"));
     session.execute("DELETE FROM archive WHERE dateTime < 0",&[]).unwrap();
@@ -262,62 +219,124 @@ fn automatic_column_pruning_keeps_journal_values_and_new_sensors() {
     assert_eq!(scalar(&mut session,"SELECT dateTime FROM archive WHERE outTemp > 999"),Cell::Integer(1));
 }
 
-#[test]
-fn background_sync_recovers_only_the_last_torn_transaction() {
-    use weewx_db::store::SyncMode;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("relaxed.wwdb");
-    let mut session = database(&path);
-    session.set_sync_mode(SyncMode::Background).unwrap();
-    session.execute("INSERT INTO archive VALUES (300,1,5)",&[]).unwrap();
-    session.execute("INSERT INTO archive VALUES (600,2,5)",&[]).unwrap();
-    let mut wal = std::fs::read(sidecar(&path,".wal")).unwrap();
-    session.flush().unwrap();
-    drop(session);
-    let last = wal.len()-1;
-    wal[last] ^= 1;
-    std::fs::write(sidecar(&path,".wal"),&wal).unwrap();
-    let mut restored = Session::open(&path,0).unwrap();
-    assert_eq!(scalar(&mut restored,"SELECT COUNT(*) FROM archive"),Cell::Integer(1));
-    restored.execute("INSERT INTO archive VALUES (900,3,5)",&[]).unwrap();
-    drop(restored);
-    let mut restored = Session::open(&path,0).unwrap();
-    assert_eq!(scalar(&mut restored,"SELECT COUNT(*) FROM archive"),Cell::Integer(2));
-    // Damage to a previous frame must still stop recovery, because another
-    // commit after it means that predecessor had already been synchronized.
-    let header_len = u32::from_le_bytes(wal[8..12].try_into().unwrap()) as usize;
-    let schema_start = 16+header_len;
-    let schema_size = (u32::from_le_bytes(wal[schema_start..schema_start+4].try_into().unwrap()) & !(1<<31)) as usize;
-    let first_start = schema_start+16+schema_size;
-    wal[first_start+16] ^= 1;
-    std::fs::write(sidecar(&path,".wal"),wal).unwrap();
-    // A process verifies each frame once; the damage is found by a new one.
-    weewx_db::store::forget_replayed_journal(&path);
-    assert!(Session::open(&path,0).is_err());
+fn blocks(session: &Session) -> usize {
+    let info = session.info().unwrap();
+    info.summarized_blocks / info.snapshot.columns.len()
 }
 
 #[test]
-fn previous_journal_format_is_readable_and_upgraded_before_writing() {
+fn compaction_fills_the_last_block_and_bounds_the_file() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("previous.wwdb");
+    let path = dir.path().join("live.wwdb");
     let mut session = database(&path);
-    session.execute("INSERT INTO archive VALUES (300,1,5)",&[]).unwrap();
-    drop(session);
-    let mut wal = std::fs::read(sidecar(&path,".wal")).unwrap();
-    wal[..8].copy_from_slice(b"WWXWAL02");
-    let header_len = u32::from_le_bytes(wal[8..12].try_into().unwrap()) as usize;
-    let mut offset = 16+header_len;
-    while offset < wal.len() {
-        let size = u32::from_le_bytes(wal[offset..offset+4].try_into().unwrap()) as usize;
-        let checksum = crc32fast::hash(&wal[offset+8..offset+16+size]);
-        wal[offset+4..offset+8].copy_from_slice(&checksum.to_le_bytes());
-        offset += 16+size;
+    let mut sizes = Vec::new();
+    // One row per transaction, as WeeWX writes, with compactions in between.
+    for round in 0..12 {
+        for i in 0..400 {
+            let time = 300 * (round * 400 + i + 1);
+            session.execute("INSERT INTO archive VALUES (?, ?, 5)", &[Cell::Integer(time), Cell::Real((i as f64).to_bits())]).unwrap();
+        }
+        session.checkpoint(false).unwrap();
+        let info = session.info().unwrap();
+        sizes.push(info.file_bytes - info.free_bytes);
     }
-    std::fs::write(sidecar(&path,".wal"),wal).unwrap();
-    let mut restored = Session::open(&path,0).unwrap();
-    assert_eq!(scalar(&mut restored,"SELECT COUNT(*) FROM archive"),Cell::Integer(1));
-    restored.execute("INSERT INTO archive VALUES (600,2,5)",&[]).unwrap();
-    drop(restored);
-    assert_eq!(&std::fs::read(sidecar(&path,".wal")).unwrap()[..8],b"WWXWAL03");
-    assert_eq!(scalar(&mut Session::open(&path,0).unwrap(),"SELECT COUNT(*) FROM archive"),Cell::Integer(2));
+    // 4800 rows fill one block of 4096 and start a second.
+    assert_eq!(blocks(&session), 2);
+    assert_eq!(scalar(&mut session, "SELECT COUNT(*) FROM archive"), Cell::Integer(4800));
+    // Replaced blocks are deleted a compaction later and their pages reused.
+    let file = std::fs::metadata(&path).unwrap().len();
+    assert!(file < 4 * sizes[11], "file {file} live {:?}", sizes);
+    let mut reopened = Session::open(&path, 0).unwrap();
+    assert_eq!(scalar(&mut reopened, "SELECT SUM(outTemp) FROM archive"), Cell::Real((12.0 * (0..400).sum::<i64>() as f64).to_bits()));
+    Store::open(&path, 0).unwrap().verify().unwrap();
+}
+
+#[test]
+fn long_lived_readers_follow_vacuum_and_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.wwdb");
+    let mut writer = database(&path);
+    for i in 1..=600 { writer.execute("INSERT INTO archive VALUES (?, 1.0, 5)", &[Cell::Integer(300 * i)]).unwrap(); }
+    writer.checkpoint(false).unwrap();
+    let mut reader = Session::open(&path, 1024 * 1024).unwrap();
+    for round in 1..=6 {
+        assert_eq!(scalar(&mut reader, "SELECT SUM(outTemp) FROM archive WHERE dateTime > 1000"), Cell::Real((597.0 + 597.0 * 100.0 * (round - 1) as f64).to_bits()));
+        writer.execute("UPDATE archive SET outTemp = outTemp + 100", &[]).unwrap();
+        if round % 2 == 0 { Store::open(&path, 0).unwrap().vacuum().unwrap(); } else { writer.checkpoint(false).unwrap(); }
+    }
+    let mut fresh = Session::open(&path, 0).unwrap();
+    assert_eq!(scalar(&mut reader, "SELECT SUM(outTemp) FROM archive"), scalar(&mut fresh, "SELECT SUM(outTemp) FROM archive"));
+}
+
+#[test]
+fn integer_columns_keep_real_values_and_infinity_is_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.wwdb");
+    let mut session = database(&path);
+    session.execute("INSERT INTO archive VALUES (300, ?, 2.5)", &[Cell::Real(f64::INFINITY.to_bits())]).unwrap();
+    session.execute("INSERT INTO archive VALUES (600, 1.0, 5)", &[]).unwrap();
+    for _ in 0..2 {
+        assert_eq!(scalar(&mut session, "SELECT interval FROM archive WHERE dateTime = 300"), Cell::Real(2.5f64.to_bits()));
+        assert_eq!(scalar(&mut session, "SELECT interval FROM archive WHERE dateTime = 600"), Cell::Integer(5));
+        assert_eq!(scalar(&mut session, "SELECT MAX(outTemp) FROM archive"), Cell::Real(f64::INFINITY.to_bits()));
+        session.checkpoint(false).unwrap();
+    }
+    assert!(session.execute("INSERT INTO archive VALUES (900, 'warm', 5)", &[]).unwrap_err().to_string().contains("datatype mismatch"));
+}
+
+#[test]
+fn crafted_files_cannot_run_statements() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("crafted.wwdb");
+    drop(database(&path));
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute("INSERT INTO metadata VALUES ('archive_day__metadata', ?, '[]')",
+        [format!("ATTACH '{}' AS x", dir.path().join("evil").display())]).unwrap();
+    drop(raw);
+    assert!(Session::open(&path, 0).is_err());
+    assert!(!dir.path().join("evil").exists());
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch("DELETE FROM metadata; CREATE TRIGGER t AFTER INSERT ON delta BEGIN SELECT 1; END;").unwrap();
+    drop(raw);
+    assert!(Session::open(&path, 0).err().unwrap().to_string().contains("unexpected trigger"));
+}
+
+
+#[test]
+fn omitted_not_null_columns_take_their_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("defaults.wwdb");
+    Store::create(&path, "archive").unwrap();
+    let mut session = Session::open(&path, 0).unwrap();
+    session.execute("CREATE TABLE archive(dateTime INTEGER NOT NULL PRIMARY KEY, usUnits INTEGER NOT NULL DEFAULT 17, outTemp REAL)", &[]).unwrap();
+    session.execute("INSERT INTO archive(dateTime, outTemp) VALUES (300, 1.5)", &[]).unwrap();
+    assert_eq!(scalar(&mut session, "SELECT usUnits FROM archive"), Cell::Integer(17));
+}
+
+#[test]
+fn backups_and_read_only_directories() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live.wwdb");
+    let mut session = database(&path);
+    session.execute("INSERT INTO archive VALUES (300, 1.5, 5)", &[]).unwrap();
+    let copy = dir.path().join("copy").join("copy.wwdb");
+    std::fs::create_dir(copy.parent().unwrap()).unwrap();
+    // The copy is consistent while the writer still holds uncompacted rows.
+    Store::open(&path, 0).unwrap().backup(&copy).unwrap();
+    assert!(Store::open(&path, 0).unwrap().backup(&copy).is_err());
+    session.execute("INSERT INTO archive VALUES (600, 2.5, 5)", &[]).unwrap();
+    {
+        let mut restored = Session::open(&copy, 0).unwrap();
+        assert_eq!(scalar(&mut restored, "SELECT COUNT(*) FROM archive"), Cell::Integer(1));
+        restored.execute("INSERT INTO archive VALUES (900, 3.5, 5)", &[]).unwrap();
+    }
+    // Without write access to its directory, a database still opens for reading.
+    let directory = copy.parent().unwrap();
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let opened = Store::open_read_only(&copy, 0).map(|mut store| store.info().unwrap().snapshot.rows);
+    let writable = Store::open(&copy, 0).is_ok();
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(opened.unwrap(), 2);
+    assert!(!writable);
 }

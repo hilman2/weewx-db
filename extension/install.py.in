@@ -51,7 +51,7 @@ class WeeWXDBInstaller(ExtensionInstaller):
                          config={'Databases': {'weewx_rust': {
                              'database_type': 'SQLite', 'driver': 'user.weewxdb.driver',
                              'database_name': 'weewx.wwdb', 'cache_mib': 32, 'workspace_mib': 32,
-                             'sync_mode': 'background'}}})
+                             'sync_mode': 'always'}}})
 
     def configure(self, engine):
         if not engine.dry_run:

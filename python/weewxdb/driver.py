@@ -106,7 +106,7 @@ class Connection(weedb.Connection):
         connection = db_connect(self.file_path, timeout=float(options.get('timeout', 5)),
                                      cache_mib=int(options.get('cache_mib', 32)),
                                      workspace_mib=int(options.get('workspace_mib', 32)),
-                                     sync_mode=options.get('sync_mode', 'background'))
+                                     sync_mode=options.get('sync_mode', 'always'))
         super().__init__(connection, database_name, 'sqlite')
         self.native = _Native(connection.native)
         # Aggregate results kept per generation for this database; 0 disables.

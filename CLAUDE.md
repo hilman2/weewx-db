@@ -1,7 +1,7 @@
 # WeeWX database
 
 Experimental Rust column store, SQL CLI and Python/weedb adapter for WeeWX.
-The current package version is 0.2.0. This repository is not a production release.
+The current package version is 0.3.0 (file format 3). This repository is not a production release yet.
 
 ## Commands
 
@@ -32,7 +32,7 @@ that `tests/test_extension.py` cannot load.
 
 ## Layout
 
-- `src/`: Rust storage, SQL, weather calculations and solar/lunar astronomy.
+- `src/`: Rust engine. `container.rs` is the SQLite file (blocks, index, changed rows), `store.rs` transactions, compaction and cursors, `lib.rs` block format and reads; then SQL, weather calculations and solar/lunar astronomy.
 - `python/weewxdb/`: Python DB-API, weedb, XType and almanac adapters.
 - `tests/`: Rust and Python differential tests.
 - `tools/`: Reference setup, benchmark and coefficient-import tools.
