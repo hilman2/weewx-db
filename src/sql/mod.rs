@@ -276,6 +276,13 @@ pub struct Session {
     explicit: bool,
     metadata_dirty: bool,
     pub(crate) active_cursors: usize,
+    /// Streaming statements of open cursors, by cursor id. Replacing the
+    /// frontend connection finalizes them first and records the ids in
+    /// `aborted`, so that their cursors report an error instead of touching
+    /// a statement of a closed connection.
+    pub(crate) streams: HashMap<u64, cursor::StreamStatement>,
+    pub(crate) aborted: std::collections::HashSet<u64>,
+    pub(crate) next_stream: u64,
     pub(crate) closed: bool,
     /// What a SQL text needs, decided once per text and schema.
     plans: HashMap<String, Arc<Plan>>,
@@ -305,13 +312,15 @@ impl Session {
         let store = Arc::new(Mutex::new(Store::open(path, cache_bytes)?));
         let connection = Self::frontend(&store)?;
         let schema = schema_signature(&*guard(&store)?);
-        Ok(Self { connection, store, explicit: false, metadata_dirty: false, active_cursors:0, closed:false,
+        Ok(Self { connection, store, explicit: false, metadata_dirty: false, active_cursors:0,
+            streams: HashMap::new(), aborted: Default::default(), next_stream: 0, closed:false,
             plans: HashMap::new(), pool: HashMap::new(), pooled: 0, generation: 0, schema })
     }
 
     /// Replace the frontend connection after a schema, metadata or rollback
     /// change. Pooled statements belong to the old connection.
     fn rebuild(&mut self) -> Result<()> {
+        self.abort_streams();
         self.forget_statements();
         self.connection = Self::frontend(&self.store)?;
         self.schema = schema_signature(&*guard(&self.store)?);
@@ -329,6 +338,16 @@ impl Session {
             for row in &table.rows { insert.execute(params_from_iter(row.iter().map(Cell::value)))?; }
         }
         Ok(())
+    }
+
+    /// Finalize the statements of all open cursors. Their next fetch fails,
+    /// as SQLite aborts pending reads on ROLLBACK.
+    fn abort_streams(&mut self) {
+        for (id, statement) in self.streams.drain() {
+            unsafe { rusqlite::ffi::sqlite3_finalize(statement.0); }
+            self.aborted.insert(id);
+        }
+        self.active_cursors = 0;
     }
 
     fn forget_statements(&mut self) {
@@ -419,8 +438,7 @@ impl Session {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         if matches!(parsed.as_ref().and_then(|s|s.first()),Some(Statement::StartTransaction {..})) {
             ensure!(!self.explicit, "transaction already active");
-            ensure!(self.active_cursors == 0,"close streaming read cursors before writing");
-            guard(&self.store)?.begin()?;
+            self.begin_store()?;
             self.connection.execute_batch("BEGIN")?;
             self.explicit = true;
             return Ok(empty());
@@ -441,8 +459,9 @@ impl Session {
         let ddl = parsed.as_ref().and_then(|s| s.first()).is_some_and(|s| matches!(s, Statement::CreateTable(_) | Statement::AlterTable {..} | Statement::Drop {..}));
         let readonly = if ddl { false } else { self.connection.prepare_cached(trimmed)?.readonly() };
         let automatic = !readonly && !self.explicit;
-        if !readonly { ensure!(self.active_cursors == 0,"close streaming read cursors before writing"); }
-        if automatic { guard(&self.store)?.begin()?; self.connection.execute_batch("BEGIN")?; }
+        // Rows and statements of an open cursor would not survive a schema change.
+        if ddl { ensure!(self.active_cursors == 0,"close streaming read cursors before changing the schema"); }
+        if automatic { self.begin_store()?; self.connection.execute_batch("BEGIN")?; }
         let point = guard(&self.store)?.savepoint();
         let result = if ddl { self.ddl(parsed.as_ref().unwrap().first().unwrap(), trimmed) }
             else { self.query(trimmed, parameters, parsed.as_ref().and_then(|s| s.first())) };
@@ -461,6 +480,14 @@ impl Session {
                 Err(error)
             }
         }
+    }
+
+    /// Writes may run while this connection still streams a read. WeeWX
+    /// rebuilds daily summaries that way: it iterates archive records and
+    /// writes each finished day on the same connection.
+    fn begin_store(&mut self) -> Result<()> {
+        let mut store = guard(&self.store)?;
+        if self.active_cursors > 0 { store.begin_keeping_snapshot() } else { store.begin() }
     }
 
     fn commit(&mut self) -> Result<()> {
