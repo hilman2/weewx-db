@@ -72,7 +72,7 @@ def test_native_weedb_manager_matches_sqlite(tmp_path):
     try:
         for manager in managers:
             manager.addRecord(records, log_success=False, log_failure=False)
-        span = (start, records[-1]['dateTime'])
+        span = weeutil.weeutil.TimeSpan(start, records[-1]['dateTime'])
         for observation in ['outTemp', 'rain', 'windSpeed', 'windvec']:
             for aggregate in ['avg', 'min', 'max'] if observation != 'windvec' else ['avg']:
                 expected = weewx.xtypes.get_aggregate(observation, span, aggregate, managers[0])
@@ -146,9 +146,9 @@ def test_native_loop_extrema_calendar_and_raw_series(tmp_path, monkeypatch, time
         for observation in ['outTemp', 'rain']:
             for aggregate, interval in [(None, None), ('avg', 10800), ('min', 86400),
                                          ('max', 86400), ('avg', 86400), ('count', 86400)]:
-                expected = weewx.xtypes.get_series(observation, (start, stop), managers[0],
+                expected = weewx.xtypes.get_series(observation, weeutil.weeutil.TimeSpan(start, stop), managers[0],
                                                   aggregate_type=aggregate, aggregate_interval=interval)
-                actual = weewx.xtypes.get_series(observation, (start, stop), managers[1],
+                actual = weewx.xtypes.get_series(observation, weeutil.weeutil.TimeSpan(start, stop), managers[1],
                                                 aggregate_type=aggregate, aggregate_interval=interval)
                 assert actual == expected
                 if observation == 'outTemp' and aggregate == 'min':

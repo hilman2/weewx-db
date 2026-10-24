@@ -82,7 +82,7 @@ entry to `weewx.conf`. Nothing else changes yet; WeeWX keeps running on SQLite.
 
 The extension does not include a JSON generator. JSON reports use the one that
 ships with WeeWX 5.6 and read from the Rust database without changes.
-Everything else works on any WeeWX 5.
+Everything else needs WeeWX 5.2 or later.
 
 ### 2. Stop WeeWX and import the archive
 
@@ -297,10 +297,11 @@ then run from a fresh clone:
 
 ```sh
 just setup    # virtual environment, pinned references, first build
-just fast     # lint, build, Rust and Python tests against the pinned WeeWX
+just fast     # lint, build, Rust and Python tests against WeeWX 5.5.2
 ```
 
-`just full` adds the Python tests against the branch with the WeeWX 5.6 JSON
+`just full` adds the Python tests against WeeWX 5.2.0, the oldest supported
+release, the pinned WeeWX fork and the branch with the WeeWX 5.6 JSON
 generator. `just build` compiles the CLI and the Python module together, and
 the test suite stops when either is older than the Rust sources. To use the
 package outside the test runs, install it with `python -m pip install -e .`.

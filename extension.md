@@ -1,7 +1,7 @@
 # Install the WeeWX database extension
 
 The extension installs the Rust database, SQL CLI, weedb driver, XTypes and
-solar/lunar almanac together on WeeWX 5. It does not include a JSON generator.
+solar/lunar almanac together on WeeWX 5.2 or later. It does not include a JSON generator.
 JSON reports use the generator that ships with WeeWX 5.6. The bundled
 subclass of it is optional and cannot be enabled on earlier releases.
 
@@ -39,12 +39,19 @@ On macOS, run `shasum -a 256 ARCHIVE.zip` and compare the printed hash with
 `SHA256SUMS`.
 
 Installation needs neither a Rust compiler nor pip. The installer refuses an
-archive built for another system or architecture, so a mismatched download
-cannot break the installation.
+archive built for another system or architecture, and WeeWX releases before
+5.2, so a mismatched download cannot break the installation.
 
 The installer places the extension under `bin/user/weewxdb` in your WeeWX root
 and adds a `weewx_rust` entry to `[Databases]` in `weewx.conf`. WeeWX keeps
 running on SQLite until you change a binding.
+
+## Upgrade the extension
+
+Stop WeeWX, install the new archive with `weectl extension install` as above,
+then start WeeWX again. The installer keeps your `weewx_rust` settings. WeeWX
+releases before 5.5 overwrite the Rust module in place, which crashes a
+running `weewxd`.
 
 ## Import and select your database
 

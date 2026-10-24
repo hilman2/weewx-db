@@ -15,12 +15,21 @@ impl RawStatement {
     pub(crate) fn finalize(self) { unsafe { ffi::sqlite3_finalize(self.0); } }
 }
 
+/// The statement of an open cursor, as registered with its session.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamStatement(pub(crate) *mut ffi::sqlite3_stmt);
+
+// Only used while holding the session mutex.
+unsafe impl Send for StreamStatement {}
+
 pub struct Cursor {
     session: Arc<Mutex<Session>>,
     statement: *mut ffi::sqlite3_stmt,
     /// SQL text and frontend generation of `statement`, for returning it to
     /// the session's pool once the result is exhausted or closed.
     origin: Option<(String, u64)>,
+    /// Registration of `statement` in the session's open streams.
+    stream: u64,
     rows: VecDeque<Vec<Cell>>,
     pub columns: Vec<String>,
     pub rowcount: i64,
@@ -41,7 +50,7 @@ impl Cursor {
             let result = locked.execute(sql,parameters)?;
             let in_transaction = locked.in_transaction();
             drop(locked);
-            return Ok(Self { session,statement:ptr::null_mut(),origin:None,rows:result.rows.into(),columns:result.columns,rowcount:result.changes as i64,engine:result.engine,in_transaction });
+            return Ok(Self { session,statement:ptr::null_mut(),origin:None,stream:0,rows:result.rows.into(),columns:result.columns,rowcount:result.changes as i64,engine:result.engine,in_transaction });
         }
         ensure!(plan.parameters == parameters.len(),"incorrect number of SQL bindings");
         let in_transaction = locked.in_transaction();
@@ -51,7 +60,7 @@ impl Cursor {
         };
         if let Some(rows) = native {
             drop(locked);
-            return Ok(Self { session,statement:ptr::null_mut(),origin:None,rows:rows.into(),columns:plan.columns.clone(),rowcount:-1,engine:"rust-native".into(),in_transaction });
+            return Ok(Self { session,statement:ptr::null_mut(),origin:None,stream:0,rows:rows.into(),columns:plan.columns.clone(),rowcount:-1,engine:"rust-native".into(),in_transaction });
         }
         let statement = match locked.take_statement(sql) {
             Some(statement) => statement.0,
@@ -71,15 +80,23 @@ impl Cursor {
         // parameter buffer is retained beyond preparation.
         if let Err(error) = unsafe { bind(statement,parameters) } { unsafe { ffi::sqlite3_finalize(statement); } return Err(error); }
         locked.active_cursors += 1;
+        locked.next_stream += 1;
+        let stream = locked.next_stream;
+        locked.streams.insert(stream, StreamStatement(statement));
         let origin = Some((sql.to_owned(), locked.generation));
         drop(locked);
-        Ok(Self { session,statement,origin,rows:VecDeque::new(),columns:plan.columns.clone(),rowcount:-1,engine:"sql-rust-storage".into(),in_transaction })
+        Ok(Self { session,statement,origin,stream,rows:VecDeque::new(),columns:plan.columns.clone(),rowcount:-1,engine:"sql-rust-storage".into(),in_transaction })
     }
 
     pub fn fetchmany(&mut self, count: usize) -> Result<Vec<Vec<Cell>>> {
         let shared = self.session.clone();
         let mut session = shared.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
         ensure!(!session.closed,"connection is closed");
+        if !self.statement.is_null() && session.aborted.remove(&self.stream) {
+            self.statement = ptr::null_mut();
+            self.rows.clear();
+            bail!("query aborted by ROLLBACK or a schema change on this connection");
+        }
         ensure!(count.saturating_mul(self.columns.len().max(1)).saturating_mul(std::mem::size_of::<Cell>()) <= guard(&session.store)?.workspace_bytes,"fetch workspace exceeded; increase workspace_mib or reduce fetch size");
         let mut rows = Vec::with_capacity(count.min(4096));
         while rows.len() < count {
@@ -121,7 +138,13 @@ impl Cursor {
     }
 
     fn finalize(&mut self, session: &mut Session) {
+        if !self.statement.is_null() && session.aborted.remove(&self.stream) {
+            // The session already finalized the statement and released the cursor.
+            self.statement = ptr::null_mut();
+            return;
+        }
         if !self.statement.is_null() {
+            session.streams.remove(&self.stream);
             match self.origin.take() {
                 Some((sql, generation)) if generation == session.generation => unsafe {
                     ffi::sqlite3_reset(self.statement);

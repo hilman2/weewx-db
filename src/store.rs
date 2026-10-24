@@ -185,13 +185,18 @@ impl Store {
     }
 
     pub fn open(path: &Path, cache_bytes: usize) -> Result<Self> {
+        Self::open_with_timeout(path, cache_bytes, Duration::from_secs(5))
+    }
+
+    /// Open, waiting at most `timeout` for a writer that holds the lock.
+    pub fn open_with_timeout(path: &Path, cache_bytes: usize, timeout: Duration) -> Result<Self> {
         ensure!(path.is_file(), "database does not exist: {}", path.display());
-        let guard = lock(path, false, Duration::from_secs(5))?;
+        let guard = lock(path, false, timeout)?;
         let snapshot = Database::open(path, cache_bytes)?;
         let lsn = snapshot.manifest.lsn;
         let mut store = Self { snapshot, path: path.to_owned(), changes: BTreeMap::new(),
             lsn, valid_wal_bytes: 0, writer: None, pending: vec![], pending_bytes: 0,
-            timeout: Duration::from_secs(5), stamp: [None, None], workspace_bytes: 32*1024*1024,
+            timeout, stamp: [None, None], workspace_bytes: 32*1024*1024,
             sync_mode:SyncMode::Always,pending_sync:None,last_relaxed:false,legacy_wal:false, aggregates: HashMap::new(),
             canonical: std::fs::canonicalize(path)? };
         store.replay()?;
@@ -369,13 +374,26 @@ impl Store {
         Ok(OpenOptions::new().read(true).write(true).open(sidecar(&self.path, ".wal"))?)
     }
 
-    pub fn begin(&mut self) -> Result<()> {
+    pub fn begin(&mut self) -> Result<()> { self.begin_with(false) }
+
+    /// Begin a transaction without replacing the snapshot. Open read cursors
+    /// hold block positions in it, so neither a reload nor the automatic
+    /// checkpoint may run; the checkpoint waits for a later transaction.
+    pub(crate) fn begin_keeping_snapshot(&mut self) -> Result<()> { self.begin_with(true) }
+
+    fn begin_with(&mut self, keep_snapshot: bool) -> Result<()> {
         ensure!(!self.in_transaction(), "transaction already active");
         self.flush()?;
         let guard = lock(&self.path, true, self.timeout)?;
-        if self.disk_stamp()? != self.stamp { self.reload()?; }
+        if self.disk_stamp()? != self.stamp {
+            ensure!(!keep_snapshot, "another connection changed the database while a read cursor is open; finish reading before writing");
+            self.reload()?;
+        }
         self.flush()?;
-        if self.valid_wal_bytes >= CHECKPOINT_BYTES || self.legacy_wal { self.checkpoint_locked(false)?; }
+        if self.legacy_wal || (!keep_snapshot && self.valid_wal_bytes >= CHECKPOINT_BYTES) {
+            ensure!(!keep_snapshot, "close read cursors before the first write to a legacy journal");
+            self.checkpoint_locked(false)?;
+        }
         if self.valid_wal_bytes == 0 { self.reset_wal()?; }
         let wal = OpenOptions::new().write(true).open(sidecar(&self.path, ".wal"))?;
         if wal.metadata()?.len() != self.valid_wal_bytes {

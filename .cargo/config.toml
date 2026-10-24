@@ -1,0 +1,4 @@
+# WeeWX's SQL for vector averages uses RADIANS, SIN and COS, and the driver
+# reports has_math. The bundled SQLite leaves them out unless asked.
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"

@@ -67,7 +67,7 @@ def test_additional_statistics(pair, aggregate):
 @pytest.mark.parametrize('interval', [86400, 'month', 'year'])
 def test_calendar_series_preserve_daily_labels(pair, aggregate, interval):
     (baseline, native), records = pair
-    span = (records[0]['dateTime'] - 3600, records[-1]['dateTime'])
+    span = weeutil.weeutil.TimeSpan(records[0]['dateTime'] - 3600, records[-1]['dateTime'])
     expected = weewx.xtypes.get_series('outTemp', span, baseline, aggregate_type=aggregate, aggregate_interval=interval)
     actual = weewx.xtypes.get_series('outTemp', span, native, aggregate_type=aggregate, aggregate_interval=interval)
     compare(actual, expected)
@@ -163,8 +163,8 @@ def test_stored_integer_xtype_preserves_values_above_float_precision(tmp_path, m
         for manager in managers:
             manager.addRecord(records, log_success=False, log_failure=False)
         for aggregate in ['min', 'max', 'sum', 'avg', 'count']:
-            assert weewx.xtypes.get_aggregate('outTemp', (0, 900), aggregate, managers[0]) \
-                == weewx.xtypes.get_aggregate('outTemp', (0, 900), aggregate, managers[1])
+            assert weewx.xtypes.get_aggregate('outTemp', weeutil.weeutil.TimeSpan(0, 900), aggregate, managers[0]) \
+                == weewx.xtypes.get_aggregate('outTemp', weeutil.weeutil.TimeSpan(0, 900), aggregate, managers[1])
     finally:
         for manager in managers:
             manager.close()
