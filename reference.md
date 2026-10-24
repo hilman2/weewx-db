@@ -12,11 +12,14 @@ and negative zero; NaN is stored as NULL. Text that is not a number fails with
 key, NOT NULL and numeric defaults are enforced; an INSERT that omits a NOT
 NULL column with a default stores the default.
 
-CREATE TABLE, DROP TABLE and ALTER TABLE ADD COLUMN are supported. New columns
-use NULL or their default for older records. A new NOT NULL column needs a
-non-NULL default. Defaults are evaluated when the schema is introduced.
-Dynamic defaults, additional unique keys, CHECK/foreign-key constraints,
-triggers, views and column removal/renaming are outside the supported schema.
+CREATE TABLE, DROP TABLE and ALTER TABLE with ADD COLUMN, RENAME COLUMN,
+DROP COLUMN and RENAME TO are supported, one operation per statement, so
+`weectl database add-column`, `rename-column` and `drop-columns` work. New
+columns use NULL or their default for older records. A new NOT NULL column
+needs a non-NULL default. Defaults are evaluated when the schema is
+introduced. dateTime cannot be renamed or dropped. Dynamic defaults,
+additional unique keys, CHECK/foreign-key constraints, triggers and views are
+outside the supported schema.
 Small tables without dateTime are metadata tables, limited to 4,096 rows.
 
 Import includes the selected archive, its numeric `*_day_*` tables and its

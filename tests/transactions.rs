@@ -340,3 +340,26 @@ fn backups_and_read_only_directories() {
     assert_eq!(opened.unwrap(), 2);
     assert!(!writable);
 }
+
+#[test]
+fn renamed_and_dropped_columns_survive_reopen_and_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("schema.wwdb");
+    let mut session = database(&path);
+    session.execute("ALTER TABLE archive ADD COLUMN pm25 REAL", &[]).unwrap();
+    session.execute("INSERT INTO archive VALUES (300, 1.0, 5, 10.0), (600, 2.0, 5, 20.0)", &[]).unwrap();
+    session.checkpoint(false).unwrap();
+    // One compacted block and one uncompacted row.
+    session.execute("INSERT INTO archive VALUES (900, 3.0, 5, 30.0)", &[]).unwrap();
+    session.execute("ALTER TABLE archive RENAME COLUMN pm25 TO pm2_5", &[]).unwrap();
+    session.execute("ALTER TABLE archive DROP COLUMN outTemp", &[]).unwrap();
+    session.execute("ALTER TABLE archive RENAME TO observations", &[]).unwrap();
+    for round in 0..2 {
+        let mut reopened = Session::open(&path, 0).unwrap();
+        let rows = reopened.execute("SELECT dateTime, interval, pm2_5 FROM observations ORDER BY dateTime", &[]).unwrap().rows;
+        assert_eq!(rows, (1..=3).map(|i| vec![Cell::Integer(300 * i), Cell::Integer(5), Cell::Real((10.0 * i as f64).to_bits())]).collect::<Vec<_>>(), "round {round}");
+        assert!(reopened.execute("SELECT outTemp FROM observations", &[]).is_err());
+        reopened.checkpoint(false).unwrap();
+    }
+    Store::open(&path, 0).unwrap().verify().unwrap();
+}

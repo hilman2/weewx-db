@@ -39,6 +39,10 @@ enum Mutation {
     Create { name: String, sql: String, columns: Vec<Column>, ordinal: u64 },
     Metadata { name: String, sql: String, rows: Vec<Vec<Cell>> },
     Add { table: String, column: Column, sql: String },
+    RenameColumn { table: String, index: usize, name: String, sql: String },
+    /// `chunks` are the payloads of the dropped column, which become garbage.
+    DropColumn { table: String, index: usize, sql: String, chunks: Vec<u64> },
+    RenameTable { table: String, name: String, sql: String },
     Drop { table: String, ordinal: Option<u64> },
 }
 
@@ -287,10 +291,23 @@ impl Store {
         for operation in &self.pending {
             match operation {
                 Mutation::Put { ordinal, time, row, .. } => container.put_delta(*ordinal, *time, seq, row.as_deref())?,
-                Mutation::Create { name, .. } | Mutation::Add { table: name, .. } => {
+                Mutation::Create { name, .. } | Mutation::Add { table: name, .. } | Mutation::RenameColumn { table: name, .. }
+                | Mutation::RenameTable { name, .. } => {
                     schema = true;
                     // The final definition; a later Drop removes it again.
                     if let Some(table) = self.snapshot.manifest.tables.iter().find(|t| t.name == *name) { container.write_table(table)?; }
+                }
+                Mutation::DropColumn { table, chunks, .. } => {
+                    schema = true;
+                    if let Some(definition) = self.snapshot.manifest.tables.iter().find(|t| t.name == *table) {
+                        container.write_table(definition)?;
+                        // Every block lost a descriptor and every changed row a cell.
+                        container.write_blocks(definition.ordinal, &[], &definition.blocks)?;
+                        if let Some(changes) = self.changes.get(table) {
+                            for (&time, row) in changes.iter() { container.put_delta(definition.ordinal, time, seq, row.as_deref())?; }
+                        }
+                    }
+                    container.discard(chunks, self.snapshot.manifest.generation + 1)?;
                 }
                 Mutation::Metadata { name, .. } => {
                     if let Some(table) = self.snapshot.manifest.metadata.iter().find(|t| t.name == *name) { container.write_metadata(table)?; }
@@ -364,6 +381,33 @@ impl Store {
                     for row in Arc::make_mut(changes).values_mut().flatten() { row.push(column.default.clone().unwrap_or(Cell::Null)); }
                 }
             }
+            Mutation::RenameColumn { table, index, name, sql } => {
+                let ti = self.table_index(table)?;
+                ensure!(!self.snapshot.manifest.tables[ti].columns.iter().any(|c| c.name.eq_ignore_ascii_case(name)), "duplicate column {name}");
+                let table = &mut tables_mut(&mut self.snapshot.manifest)[ti];
+                table.columns[*index].name = name.clone();
+                table.sql = sql.clone();
+            }
+            Mutation::DropColumn { table, index, sql, .. } => {
+                let ti = self.table_index(table)?;
+                let definition = &mut tables_mut(&mut self.snapshot.manifest)[ti];
+                definition.columns.remove(*index);
+                definition.sql = sql.clone();
+                // Column descriptors and cells are positional.
+                for block in &mut definition.blocks { if *index < block.columns.len() { block.columns.remove(*index); } }
+                let name = definition.name.clone();
+                if let Some(changes) = self.changes.get_mut(&name) {
+                    for row in Arc::make_mut(changes).values_mut().flatten() { if *index < row.len() { row.remove(*index); } }
+                }
+            }
+            Mutation::RenameTable { table, name, sql } => {
+                ensure!(!self.tables().iter().any(|t| t.eq_ignore_ascii_case(name)), "table already exists: {name}");
+                let ti = self.table_index(table)?;
+                let definition = &mut tables_mut(&mut self.snapshot.manifest)[ti];
+                let old = std::mem::replace(&mut definition.name, name.clone());
+                definition.sql = sql.clone();
+                if let Some(changes) = self.changes.remove(&old) { self.changes.insert(name.clone(), changes); }
+            }
             Mutation::Drop { table, .. } => {
                 tables_mut(&mut self.snapshot.manifest).retain(|t| t.name != *table);
                 Arc::make_mut(&mut self.snapshot.manifest).metadata.retain(|t| t.name != *table);
@@ -409,6 +453,27 @@ impl Store {
         ensure!(!column.not_null || column.default.is_some(), "a new NOT NULL column needs a default");
         validate_cell(&column, column.default.as_ref().unwrap_or(&Cell::Null))?;
         self.stage(Mutation::Add { table: table.to_owned(), column, sql: sql.to_owned() })
+    }
+
+    pub fn rename_column(&mut self, table: &str, old: &str, name: &str, sql: &str) -> Result<()> {
+        let index = self.column_defs(table)?.iter().position(|c| c.name.eq_ignore_ascii_case(old)).with_context(|| format!("no such column: {old}"))?;
+        ensure!(old != "dateTime", "dateTime cannot be renamed");
+        crate::container::validate_definition(sql, table)?;
+        self.stage(Mutation::RenameColumn { table: table.to_owned(), index, name: name.to_owned(), sql: sql.to_owned() })
+    }
+
+    pub fn drop_column(&mut self, table: &str, column: &str, sql: &str) -> Result<()> {
+        let ti = self.table_index(table)?;
+        let index = self.column_defs(table)?.iter().position(|c| c.name.eq_ignore_ascii_case(column)).with_context(|| format!("no such column: {column}"))?;
+        ensure!(column != "dateTime", "dateTime cannot be dropped");
+        crate::container::validate_definition(sql, table)?;
+        let chunks = self.snapshot.manifest.tables[ti].blocks.iter().filter_map(|b| b.columns.get(index)).map(|c| c.chunk).filter(|&c| c > 0).collect();
+        self.stage(Mutation::DropColumn { table: table.to_owned(), index, sql: sql.to_owned(), chunks })
+    }
+
+    pub fn rename_table(&mut self, table: &str, name: &str, sql: &str) -> Result<()> {
+        crate::container::validate_definition(sql, name)?;
+        self.stage(Mutation::RenameTable { table: table.to_owned(), name: name.to_owned(), sql: sql.to_owned() })
     }
 
     pub fn drop_table(&mut self, table: &str) -> Result<()> {
@@ -856,7 +921,12 @@ fn touched(operations: &[Mutation]) -> Vec<crate::changes::Range> {
         let (table, first, last) = match operation {
             Mutation::Put { table, time, .. } => (table, *time, *time),
             Mutation::Create { name, .. } | Mutation::Metadata { name, .. } => (name, i64::MIN, i64::MAX),
-            Mutation::Add { table, .. } | Mutation::Drop { table, .. } => (table, i64::MIN, i64::MAX),
+            Mutation::Add { table, .. } | Mutation::Drop { table, .. } | Mutation::RenameColumn { table, .. }
+            | Mutation::DropColumn { table, .. } => (table, i64::MIN, i64::MAX),
+            Mutation::RenameTable { table, name, .. } => {
+                ranges.push((table.clone(), i64::MIN, i64::MAX));
+                (name, i64::MIN, i64::MAX)
+            }
         };
         match ranges.iter_mut().find(|(name, ..)| name == table) {
             Some(range) => { range.1 = range.1.min(first); range.2 = range.2.max(last); }

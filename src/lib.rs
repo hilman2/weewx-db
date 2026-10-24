@@ -310,6 +310,12 @@ fn shared_files() -> &'static std::sync::Mutex<HashMap<std::path::PathBuf, Share
 /// Indices kept per database: the current and the previous generation.
 const SHARED_INDICES: usize = 2;
 
+/// The text of a caught panic.
+pub(crate) fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic".to_owned())
+}
+
 pub fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }

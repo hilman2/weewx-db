@@ -25,6 +25,18 @@ fn py_error(error: impl Into<anyhow::Error>) -> PyErr {
 
 fn py_message(message: &str) -> PyErr { PyValueError::new_err(message.to_owned()) }
 
+/// Run `work` without the GIL. A panic becomes an ordinary error instead of
+/// pyo3's PanicException, which derives from BaseException: WeeWX's
+/// `except Exception` handlers would miss it and weewxd would exit.
+fn detach<T: Send, E: Send + FromPanic>(py: Python<'_>, work: impl FnOnce() -> std::result::Result<T, E> + Send) -> std::result::Result<T, E> {
+    py.detach(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|panic| Err(E::from_panic(format!("internal error: {}", crate::panic_message(&panic))))))
+}
+
+trait FromPanic { fn from_panic(message: String) -> Self; }
+impl FromPanic for anyhow::Error { fn from_panic(message: String) -> Self { anyhow::anyhow!(message) } }
+impl FromPanic for PyErr { fn from_panic(message: String) -> Self { PyValueError::new_err(message) } }
+
 /// Duration::from_secs_f64 panics on negative or non-finite input.
 fn ensure_timeout(seconds: f64) -> PyResult<()> {
     if seconds.is_finite() && (0.0..=3600.0).contains(&seconds) { Ok(()) } else { Err(py_message("invalid lock timeout")) }
@@ -44,7 +56,7 @@ impl PyConnection {
         let cache = cache_mib.checked_mul(1024*1024).ok_or_else(||py_message("cache size overflow"))?;
         let workspace = workspace_mib.checked_mul(1024*1024).ok_or_else(||py_message("workspace size overflow"))?;
         ensure_timeout(timeout)?;
-        let session = py.detach(|| -> Result<_> {
+        let session = detach(py,|| -> Result<_> {
             let mut session = Session::open_with_timeout(Path::new(&path),cache,std::time::Duration::from_secs_f64(timeout))?;
             session.set_workspace(workspace)?;
             session.set_sync_mode(sync_mode.parse()?)?;
@@ -62,26 +74,26 @@ impl PyConnection {
     #[pyo3(signature=(sql,parameters=None))]
     fn execute(&self, py: Python<'_>, sql: String, parameters: Option<Vec<Py<PyAny>>>) -> PyResult<PyCursor> {
         let parameters = parameters.unwrap_or_default().iter().map(|v|from_python(v.bind(py))).collect::<PyResult<Vec<_>>>()?;
-        let cursor = py.detach(||Cursor::open(self.session.clone(),&sql,&parameters)).map_err(py_error)?;
+        let cursor = detach(py,||Cursor::open(self.session.clone(),&sql,&parameters)).map_err(py_error)?;
         Ok(PyCursor { columns: cursor.columns.clone(), rowcount: cursor.rowcount, in_transaction: cursor.in_transaction, cursor:Mutex::new(cursor) })
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(||self.session.lock().map_err(|_|py_message("connection mutex poisoned"))?.close().map_err(py_error))
+        detach(py,||self.session.lock().map_err(|_|py_message("connection mutex poisoned"))?.close().map_err(py_error))
     }
 
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(||self.session.lock().map_err(|_|py_message("connection mutex poisoned"))?.flush().map_err(py_error))
+        detach(py,||self.session.lock().map_err(|_|py_message("connection mutex poisoned"))?.flush().map_err(py_error))
     }
 
     #[pyo3(signature=(rebuild=false))]
     fn checkpoint(&self, py: Python<'_>, rebuild: bool) -> PyResult<()> {
-        py.detach(||self.session.lock().map_err(|_|py_message("connection mutex poisoned"))?.checkpoint(rebuild).map_err(py_error))
+        detach(py,||self.session.lock().map_err(|_|py_message("connection mutex poisoned"))?.checkpoint(rebuild).map_err(py_error))
     }
 
     #[pyo3(signature=(table,column,start,stop,daily=false))]
     fn aggregate(&self, py: Python<'_>, table: String, column: String, start: i64, stop: i64, daily: bool) -> PyResult<AggregateResult> {
-        let stats = py.detach(|| -> Result<Stats> {
+        let stats = detach(py,|| -> Result<Stats> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             crate::sql::guard(&session.store)?.aggregate(&table,&column,Span {start,stop,daily})
@@ -90,7 +102,7 @@ impl PyConnection {
     }
 
     fn series(&self, py: Python<'_>, table: String, column: String, ranges: Vec<(i64,i64)>, aggregate: String) -> PyResult<Py<PyAny>> {
-        let values = py.detach(|| -> Result<Vec<Cell>> {
+        let values = detach(py,|| -> Result<Vec<Cell>> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             crate::sql::guard(&session.store)?.series_ranges(&table,&column,&ranges,&aggregate)
@@ -101,7 +113,7 @@ impl PyConnection {
     }
 
     fn raw_series(&self, py: Python<'_>, table: String, column: String, start: i64, stop: i64) -> PyResult<(Vec<i64>,Vec<i64>,Py<PyAny>)> {
-        let (starts,stops,values) = py.detach(|| -> Result<_> {
+        let (starts,stops,values) = detach(py,|| -> Result<_> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             crate::sql::guard(&session.store)?.raw_series(&table,&column,start,stop)
@@ -113,7 +125,7 @@ impl PyConnection {
 
     fn computed_aggregate(&self, py: Python<'_>, table: String, specification: ComputationSpec, start: i64, stop: i64) -> PyResult<ComputedResult> {
         let source = computed_source(specification)?;
-        let summary = py.detach(|| -> Result<crate::computed::ComputedSummary> {
+        let summary = detach(py,|| -> Result<crate::computed::ComputedSummary> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             crate::sql::guard(&session.store)?.computed_summary(&table,&source,Span {start,stop,daily:false},true)
@@ -123,7 +135,7 @@ impl PyConnection {
 
     fn computed_series(&self, py: Python<'_>, table: String, specification: ComputationSpec, ranges: Vec<(i64,i64)>, aggregate: String) -> PyResult<(Py<PyAny>,u64)> {
         let source = computed_source(specification)?;
-        let (values,source_rows) = py.detach(|| -> Result<(Vec<Cell>,u64)> {
+        let (values,source_rows) = detach(py,|| -> Result<(Vec<Cell>,u64)> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             crate::sql::guard(&session.store)?.computed_series(&table,&source,&ranges,&aggregate)
@@ -135,7 +147,7 @@ impl PyConnection {
 
     fn computed_raw(&self, py: Python<'_>, table: String, specification: ComputationSpec, start: i64, stop: i64) -> PyResult<(Vec<i64>,Vec<i64>,Py<PyAny>)> {
         let source = computed_source(specification)?;
-        let (starts,stops,values) = py.detach(|| -> Result<_> {
+        let (starts,stops,values) = detach(py,|| -> Result<_> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             crate::sql::guard(&session.store)?.computed_raw(&table,&source,start,stop)
@@ -148,7 +160,7 @@ impl PyConnection {
     fn packet_native(&self, py: Python<'_>, table: String, record: &Bound<'_,PyAny>, specifications: &Bound<'_,PyAny>) -> PyResult<Py<PyAny>> {
         let mut record = python_json(record,0)?;
         let specifications: Vec<(String,crate::weather::WeatherSpec)> = serde_json::from_value(python_json(specifications,0)?).map_err(py_error)?;
-        let result = py.detach(|| -> Result<_> {
+        let result = detach(py,|| -> Result<_> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             let mut store = crate::sql::guard(&session.store)?;
@@ -193,7 +205,7 @@ impl PyConnection {
 
     fn analytics_native(&self, py: Python<'_>, specification: &Bound<'_,PyAny>) -> PyResult<Py<PyAny>> {
         let query = serde_json::from_value(python_json(specification,0)?).map_err(py_error)?;
-        let answer = py.detach(|| -> Result<_> {
+        let answer = detach(py,|| -> Result<_> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             crate::sql::guard(&session.store)?.analytics(&query)
@@ -203,7 +215,7 @@ impl PyConnection {
 
     fn analytics_many_native(&self, py: Python<'_>, specifications: &Bound<'_,PyAny>) -> PyResult<Py<PyAny>> {
         let queries: Vec<crate::analytics::Query> = serde_json::from_value(python_json(specifications,0)?).map_err(py_error)?;
-        let answer = py.detach(|| -> Result<_> {
+        let answer = detach(py,|| -> Result<_> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             crate::sql::guard(&session.store)?.analytics_many(&queries)
@@ -217,7 +229,7 @@ impl PyConnection {
     }
 
     fn revision(&self, py: Python<'_>) -> PyResult<Option<(String,u64)>> {
-        py.detach(|| -> Result<_> {
+        detach(py,|| -> Result<_> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             if session.in_transaction() { return Ok(None); }
@@ -229,7 +241,7 @@ impl PyConnection {
     /// Whether no transaction after revision `since` changed any of the
     /// `(table, first, last)` time ranges. False inside a transaction.
     fn unchanged(&self, py: Python<'_>, since: u64, ranges: Vec<(String,i64,i64)>) -> PyResult<bool> {
-        py.detach(|| -> Result<bool> {
+        detach(py,|| -> Result<bool> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             if session.in_transaction() { return Ok(false); }
@@ -240,7 +252,7 @@ impl PyConnection {
 
     fn analytics(&self, py: Python<'_>, specification: String) -> PyResult<String> {
         let query: crate::analytics::Query = serde_json::from_str(&specification).map_err(py_error)?;
-        py.detach(|| -> Result<String> {
+        detach(py,|| -> Result<String> {
             let mut session = self.session.lock().map_err(|_|anyhow::anyhow!("connection mutex poisoned"))?;
             session.refresh()?;
             let answer = crate::sql::guard(&session.store)?.analytics(&query)?;
@@ -271,7 +283,7 @@ impl PyCursor {
     fn fetchall(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let list = PyList::empty(py);
         loop {
-            let rows = py.detach(||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.fetchmany(1024).map_err(py_error))?;
+            let rows = detach(py,||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.fetchmany(1024).map_err(py_error))?;
             if rows.is_empty() { break; }
             for row in rows {
                 let cells = row.iter().map(|v|to_python(py,v)).collect::<PyResult<Vec<_>>>()?;
@@ -283,7 +295,7 @@ impl PyCursor {
 
     #[pyo3(signature=(size=200))]
     fn fetchmany(&self, py: Python<'_>, size: usize) -> PyResult<Py<PyAny>> {
-        let rows = py.detach(||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.fetchmany(size).map_err(py_error))?;
+        let rows = detach(py,||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.fetchmany(size).map_err(py_error))?;
         let list = PyList::empty(py);
         for row in rows {
             let cells = row.iter().map(|v|to_python(py,v)).collect::<PyResult<Vec<_>>>()?;
@@ -293,14 +305,14 @@ impl PyCursor {
     }
 
     fn fetchone(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
-        let rows = py.detach(||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.fetchmany(1).map_err(py_error))?;
+        let rows = detach(py,||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.fetchmany(1).map_err(py_error))?;
         rows.first().map(|row| {
             let cells = row.iter().map(|v|to_python(py,v)).collect::<PyResult<Vec<_>>>()?;
             Ok(PyTuple::new(py,cells)?.into_any().unbind())
         }).transpose()
     }
 
-    fn close(&self, py: Python<'_>) -> PyResult<()> { py.detach(||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.close().map_err(py_error)) }
+    fn close(&self, py: Python<'_>) -> PyResult<()> { detach(py,||self.cursor.lock().map_err(|_|py_message("cursor mutex poisoned"))?.close().map_err(py_error)) }
 }
 
 fn from_python(value: &Bound<'_,PyAny>) -> PyResult<Cell> {
@@ -377,26 +389,26 @@ fn json_python(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>>
 #[pyfunction]
 fn astronomy_native(py:Python<'_>,specification:&Bound<'_,PyAny>)->PyResult<Py<PyAny>> {
     let request = serde_json::from_value(python_json(specification,0)?).map_err(py_error)?;
-    let result = py.detach(||crate::astro::execute(&request)).map_err(py_error)?;
+    let result = detach(py,||crate::astro::execute(&request)).map_err(py_error)?;
     json_python(py,&result)
 }
 
 #[pyfunction]
-fn create(py: Python<'_>, path: String) -> PyResult<()> { py.detach(||Store::create(Path::new(&path),"archive")).map_err(py_error) }
+fn create(py: Python<'_>, path: String) -> PyResult<()> { detach(py,||Store::create(Path::new(&path),"archive")).map_err(py_error) }
 
 #[pyfunction]
-fn drop_database(py: Python<'_>, path: String) -> PyResult<()> { py.detach(||Store::drop_database(Path::new(&path))).map_err(py_error) }
+fn drop_database(py: Python<'_>, path: String) -> PyResult<()> { detach(py,||Store::drop_database(Path::new(&path))).map_err(py_error) }
 
 #[pyfunction]
 fn astronomy(py:Python<'_>,specification:String)->PyResult<String>{
     let request:crate::astro::Request=serde_json::from_str(&specification).map_err(py_error)?;
-    py.detach(||->Result<String>{Ok(serde_json::to_string(&crate::astro::execute(&request)?)?)}).map_err(py_error)
+    detach(py,||->Result<String>{Ok(serde_json::to_string(&crate::astro::execute(&request)?)?)}).map_err(py_error)
 }
 
 #[cfg(unix)]
 #[pyfunction]
 fn local_intervals(py: Python<'_>, start: i64, stop: i64, interval: i64) -> PyResult<Vec<(i64,i64)>> {
-    py.detach(||crate::weather::local_intervals(start,stop,interval)).map_err(py_error)
+    detach(py,||crate::weather::local_intervals(start,stop,interval)).map_err(py_error)
 }
 
 #[pymodule]
