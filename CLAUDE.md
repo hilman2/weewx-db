@@ -5,15 +5,23 @@ The current package version is 0.2.0. This repository is not a production releas
 
 ## Commands
 
-Run from the repository root after the development setup in README.md:
+Run from the repository root. `just setup` creates `.venv`, fetches the pinned
+references and builds once.
 
-- `cargo test --locked --tests`
-- `cargo clippy --all-targets --features python --locked -- -D warnings`
-- `cargo build --release --locked`
-- `PYTHONPATH=build/weewx-db-trial/weewx-source/src .venv/bin/python -m pytest -q tests`
+- `just fast`: clippy, release build with the python feature, Rust tests with
+  nextest, Python tests with xdist against `weewx-source`. About 5 s without
+  changes, 16 s after a Rust change, 25 s cold.
+- `just affected`: like fast; after Python-only changes pytest runs with testmon.
+- `just full`: fast plus the Python tests against `json-source` (WeeWX 5.6).
+- `just build`: `cargo build --release --locked --features python` and a copy of
+  the library to `python/weewxdb/_weewxdb.abi3.so`. `tests/conftest.py` stops the
+  session when the CLI, library or module is missing or older than `src/`.
+- Single tests: `just test-python build/weewx-db-trial/weewx-source/src "tests/test_x.py -k name"`
+  or `cargo nextest run --locked --test storage -E 'test(name)'`.
 
-The Python integration tests need the installed extension and release CLI.
 `python3 tools/fetch_references.py` obtains the pinned public reference checkouts.
+A plain `cargo build --release` without `--features python` produces a library
+that `tests/test_extension.py` cannot load.
 
 ## Layout
 

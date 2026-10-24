@@ -285,29 +285,25 @@ CSV, TSV and JSONL exports stream rows.
 
 ## Develop and test
 
-Development uses a local Rust build and the `weewxdb` Python package installed
-with pip. In this layout the driver is `weewxdb.driver` and the CLI is
+Development uses a local Rust build and the `weewxdb` Python package in
+`python/`. In this layout the driver is `weewxdb.driver` and the CLI is
 `target/release/weewx-db`. Station installations use the extension instead.
 
 Tests use pinned public reference sources listed in
 [references.json](references.json): WeeWX, the WeeWX branch carrying the 5.6
 JSON generator, xaggs and PyEphem. Python 3.13 and Rust 1.99 were used for the
-recorded checks. Install a Rust toolchain, Python and Git, then run from a
-fresh clone:
+recorded checks. Install a Rust toolchain, cargo-nextest, just, Python and Git,
+then run from a fresh clone:
 
 ```sh
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements-test.txt
-python -m pip install -e .
-python tools/fetch_references.py
-cargo test --locked --tests
-cargo clippy --all-targets --features python --locked -- -D warnings
-cargo build --release --locked
-PYTHONPATH=build/weewx-db-trial/weewx-source/src python -m pytest -q tests
-PYTHONPATH=build/weewx-db-trial/json-source/src python -m pytest -q tests
+just setup    # virtual environment, pinned references, first build
+just fast     # lint, build, Rust and Python tests against the pinned WeeWX
 ```
 
+`just full` adds the Python tests against the branch with the WeeWX 5.6 JSON
+generator. `just build` compiles the CLI and the Python module together, and
+the test suite stops when either is older than the Rust sources. To use the
+package outside the test runs, install it with `python -m pip install -e .`.
 The reference fetcher verifies existing checkouts before reusing them.
 `weewx-db fixture FILE.sdb` generates a synthetic SQLite archive, `import`
 converts it and `bench` compares both. The repository contains the measurement

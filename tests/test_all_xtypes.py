@@ -289,7 +289,7 @@ def test_computed_series_uses_one_native_request(tmp_path, monkeypatch, observat
         native.close()
 
 
-@pytest.mark.parametrize('aggregate', list(weewx.xtypes.ArchiveTable.valid_aggregate_types))
+@pytest.mark.parametrize('aggregate', sorted(weewx.xtypes.ArchiveTable.valid_aggregate_types))
 def test_every_archive_aggregate(daily_pair, monkeypatch, aggregate):
     (baseline, native), full_span = daily_pair
     span = weeutil.weeutil.TimeSpan(full_span.start + 17, full_span.stop - 17)
