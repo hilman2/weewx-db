@@ -50,7 +50,7 @@ def test_lunar_almanac_and_sidereal(monkeypatch, stamp):
     almanac = weewx.almanac.Almanac(stamp, 52, 13)
     names = ['moon_index', 'moon_phase', 'moon_fullness', 'sidereal_time', 'sidereal_angle'] + [
         direction + '_' + phase for direction in ['next', 'previous']
-        for phase in ['new_moon', 'first_quarter_moon', 'full_moon', 'last_quarter_moon']]
+        for phase in ['new_moon', 'first_quarter_moon', 'full_moon', 'last_quarter_moon']] + list(weewxdb.almanac.SEASONS)
     monkeypatch.setattr(weewx.almanac, 'almanacs', [weewx.almanac.PyEphemAlmanacType()])
     expected = {name: getattr(almanac, name) for name in names}
     monkeypatch.setattr(weewx.almanac, 'almanacs', [weewxdb.almanac.NativeAlmanac()])
@@ -59,7 +59,9 @@ def test_lunar_almanac_and_sidereal(monkeypatch, stamp):
         actual = getattr(almanac, name)
         if isinstance(reference, weewx.units.ValueHelper):
             assert actual.value_t[1:] == reference.value_t[1:]
-            assert actual.raw == pytest.approx(reference.raw, abs=0.05 if reference.value_t[1] == 'unix_epoch' else 1e-9, rel=0)
+            # Equinoxes and solstices within a second of PyEphem.
+            tolerance = 0.05 if reference.value_t[1] == 'unix_epoch' else 1 / 86400 if name in weewxdb.almanac.SEASONS else 1e-9
+            assert actual.raw == pytest.approx(reference.raw, abs=tolerance, rel=0), name
         else:
             assert actual == pytest.approx(reference, abs=1e-9) if isinstance(reference, float) else actual == reference
 
@@ -88,6 +90,27 @@ assert almanac.sun.rise.raw is not None
 assert almanac.moon.set.raw is not None
 assert almanac(horizon=-18).sun(use_center=True).rise.raw < almanac.sun.rise.raw
 assert 0 <= almanac.moon_index <= 7
+# Seasons, Standard and Belchertown compare these once hasExtras is set.
+assert almanac.next_equinox.raw < almanac.next_solstice.raw or almanac.next_solstice.raw < almanac.next_equinox.raw
+assert almanac.previous_winter_solstice.raw < 1704110400 < almanac.next_vernal_equinox.raw
 assert sys.modules['ephem'] is None
 '''
     subprocess.run([sys.executable, '-c', program], check=True, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize('day,horizon', [((1, 14), 0), ((5, 18), 0), ((7, 24), 0), ((8, 13), -6), ((11, 27), 0)])
+def test_polar_transition_days_match_pyephem(monkeypatch, day, horizon):
+    # Around the first and last days of polar night and midnight sun the Sun
+    # crosses the horizon on one day but not the next; PyEphem then reports
+    # no rise or set for the day without one.
+    import calendar
+    stamp = calendar.timegm((2024,) + day + (12, 0, 0))
+    almanac = weewx.almanac.Almanac(stamp, 69.65, 18.96, horizon=horizon)
+    for attr in ['rise', 'set', 'visible']:
+        monkeypatch.setattr(weewx.almanac, 'almanacs', [weewx.almanac.PyEphemAlmanacType()])
+        expected = getattr(almanac.sun(use_center=horizon != 0), attr).raw
+        monkeypatch.setattr(weewx.almanac, 'almanacs', [weewxdb.almanac.NativeAlmanac()])
+        actual = getattr(almanac.sun(use_center=horizon != 0), attr).raw
+        assert (actual is None) == (expected is None), attr
+        if expected is not None:
+            assert actual == pytest.approx(expected, abs=60), attr

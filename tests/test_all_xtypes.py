@@ -315,3 +315,38 @@ def test_degree_days(daily_pair, monkeypatch, observation, aggregate):
         monkeypatch.setattr(native, name, lambda *a, **k: pytest.fail('Python database access used'))
     actual = weewx.xtypes.get_aggregate(observation, span, aggregate, native, **options)
     compare(actual, expected)
+
+
+@pytest.mark.parametrize('observation', ['heatdeg', 'growdeg'])
+@pytest.mark.parametrize('aggregate', ['sum', 'cumulative'])
+def test_degree_day_series(daily_pair, monkeypatch, observation, aggregate):
+    (baseline, native), span = daily_pair
+    monkeypatch.setattr(weewx.xtypes, 'xtypes', builtin_providers())
+    expected = weewx.xtypes.get_series(observation, span, baseline, aggregate, 86400)
+    actual = weewx.xtypes.get_series(observation, span, native, aggregate, 86400)
+    compare(actual, expected)
+
+
+def test_day_bins_keep_loop_extrema_inside_an_ineligible_span(tmp_path, monkeypatch):
+    import weedb
+    start = 1704067200
+    records = hardware_records(start, 17, count=120, interval=3600)
+    baseline, native = open_pair(tmp_path, records, daily=True)
+    try:
+        # LOOP packets raised every day's maximum above its archive records.
+        for manager in [baseline, native]:
+            with weedb.Transaction(manager.connection) as cursor:
+                cursor.execute('UPDATE archive_day_outTemp SET max = max + 2.5')
+        monkeypatch.setattr(weewx.xtypes, 'xtypes', builtin_providers())
+        # From a local midnight to a time that is neither midnight nor the
+        # newest record: the span as a whole cannot use daily summaries, but
+        # its whole days can.
+        midnight = weeutil.weeutil.startOfDay(start + 86400 + 43200)
+        span = weeutil.weeutil.TimeSpan(midnight, records[-1]['dateTime'] - 1800)
+        for aggregate in ['max', 'min', 'avg']:
+            expected = weewx.xtypes.get_series('outTemp', span, baseline, aggregate, 'day')
+            actual = weewx.xtypes.get_series('outTemp', span, native, aggregate, 'day')
+            compare(actual, expected)
+    finally:
+        baseline.close()
+        native.close()

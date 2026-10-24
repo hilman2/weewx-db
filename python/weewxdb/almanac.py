@@ -23,6 +23,46 @@ def observer_key(almanac):
             almanac.pressure, almanac.temperature, almanac.horizon)
 
 
+# Equinoxes and solstices as PyEphem finds them: where the Sun's apparent
+# geocentric right ascension reaches 0 (vernal equinox), 90 (summer
+# solstice), 180 or 270 degrees. Each entry is the (motion, offset) pair of
+# PyEphem's holiday() call for that name, in radians.
+SEASONS = {
+    'previous_vernal_equinox': (-2 * math.pi, 0), 'next_vernal_equinox': (2 * math.pi, 0),
+    'previous_summer_solstice': (-2 * math.pi, 1.5 * math.pi), 'next_summer_solstice': (2 * math.pi, 1.5 * math.pi),
+    'previous_autumnal_equinox': (-2 * math.pi, math.pi), 'next_autumnal_equinox': (2 * math.pi, math.pi),
+    'previous_winter_solstice': (-2 * math.pi, 0.5 * math.pi), 'next_winter_solstice': (2 * math.pi, 0.5 * math.pi),
+    'previous_equinox': (-math.pi, 0), 'next_equinox': (math.pi, 0),
+    'previous_solstice': (-math.pi, 0.5 * math.pi), 'next_solstice': (math.pi, 0.5 * math.pi),
+}
+
+
+def season(almanac, motion, offset):
+    """Return the Dublin Julian date of the equinox or solstice described by
+    one entry of SEASONS, searched from the almanac's time like PyEphem's
+    holiday().
+    """
+    def right_ascension(stamp):
+        key = (stamp,) + observer_key(almanac)[1:]
+        return math.radians(calculate(key, 'sun', 'position')['geocentric_ra'])
+
+    def distance(stamp):
+        # Distance in right ascension to the nearest multiple of 45 degrees.
+        return (right_ascension(stamp) + math.pi / 8) % (math.pi / 4) - math.pi / 8
+
+    angle = motion - (right_ascension(almanac.time_ts) + offset) % motion
+    if abs(angle) < math.radians(1 / 3600) / 360:
+        angle = motion
+    # Secant iteration from a first guess one hour wide, to 0.1 seconds.
+    x0 = almanac.time_ts + 365.25 * 86400 * angle / (2 * math.pi)
+    x1 = x0 + 3600
+    f0, f1 = distance(x0), distance(x1)
+    while f1 and abs(x1 - x0) > 0.1 and f1 != f0:
+        x0, x1 = x1, x1 + (x1 - x0) / (f0 / f1 - 1)
+        f0, f1 = f1, distance(x1)
+    return x1 / 86400 + 25567.5
+
+
 def helper(almanac, value, unit, group, context='ephem_day'):
     return weewx.units.ValueHelper(weewx.units.ValueTuple(value, unit, group), context=context,
                                    formatter=almanac.formatter, converter=almanac.converter)
@@ -66,6 +106,8 @@ class NativeAlmanac(weewx.almanac.AlmanacType):
             values = [value for name, value in phases if name == phase]
             value = min(v for v in values if v > stamp) if direction == 'next' else max(v for v in values if v < stamp)
             return helper(almanac_obj, value / 86400 + 25567.5, 'dublin_jd', 'group_time', 'ephem_year')
+        if attr in SEASONS:
+            return helper(almanac_obj, season(almanac_obj, *SEASONS[attr]), 'dublin_jd', 'group_time', 'ephem_year')
         if attr in ['sidereal_time', 'sidereal_angle']:
             value = calculate(observer_key(almanac_obj), 'sun', 'sidereal')
             return value if attr == 'sidereal_time' else helper(almanac_obj, value, 'degree_compass', 'group_direction')
@@ -86,10 +128,27 @@ class Body:
         start, stop = (stamp - 2 * 86400, stamp) if previous else (stamp, stamp + 2 * 86400)
         return calculate(observer_key(self.almanac), self.heavenly_body, 'events', start, stop, self.use_center)
 
+    def circumpolar_today(self):
+        """Return 'always_up' or 'never_up' when the body crosses the horizon
+        neither way on the almanac's day, else None.
+
+        PyEphem then raises AlwaysUpError or NeverUpError for that day's
+        rise and set, even when the body crosses the next day, and WeeWX
+        shows no time.
+        """
+        start = weeutil.weeutil.startOfDay(self.almanac.time_ts)
+        today = calculate(observer_key(self.almanac), self.heavenly_body, 'events', start, start + 86400, self.use_center)
+        if today['rises'] or today['sets']:
+            return None
+        return 'always_up' if today['always_up'] else 'never_up'
+
     @property
     def visible(self):
         events = self.event_data(weeutil.weeutil.startOfDay(self.almanac.time_ts))
-        if events['rises'] and events['sets']:
+        circumpolar = self.circumpolar_today()
+        if circumpolar:
+            value = 86400 if circumpolar == 'always_up' else 0
+        elif events['rises'] and events['sets']:
             value = events['sets'][0] - events['rises'][0]
         else:
             value = 86400 if events['always_up'] else 0
@@ -110,6 +169,8 @@ class Body:
             stamp = self.almanac.time_ts
             if attr in ['rise', 'set', 'transit']:
                 stamp = weeutil.weeutil.startOfDay(stamp)
+                if attr != 'transit' and self.circumpolar_today():
+                    return helper(self.almanac, None, 'dublin_jd', 'group_time')
                 attr = {'rise': 'next_rising', 'set': 'next_setting', 'transit': 'next_transit'}[attr]
             previous = attr.startswith('previous_')
             events = self.event_data(stamp, previous)
