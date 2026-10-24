@@ -169,7 +169,9 @@ impl Store {
         if query.mode == "daily" && query.ranges.len() == 1 && query.threshold.is_none()
             && let Some(answer) = self.daily_summary_analytics(query)? { return Ok(answer); }
         if query.mode == "daily" || query.mode == "historical" || query.mode == "degree" || query.mode == "xagg_avg" {
-            return self.daily_analytics(query);
+            let mut answer = self.daily_analytics(query)?;
+            if query.mode == "degree" && query.aggregate == "cumulative" { running_sum(&mut answer.values); }
+            return Ok(answer);
         }
         if query.mode == "vector" || query.mode == "wind" { return self.vector_analytics(query); }
         if query.mode == "gustdir" || query.mode == "archive" && matches!(query.aggregate.as_str(),"diff"|"tderiv") {return self.archive_special(query);}
@@ -233,10 +235,7 @@ impl Store {
         }
         if !query.raw {
             for reduction in &reductions { answer.values.push(reduction.finish(&query.aggregate,query.weather.is_some(),query.threshold)?); }
-            if query.aggregate == "cumulative" {
-                let mut sum = Accumulator::default();
-                for value in &mut answer.values { sum.add(value.as_f64()); *value = json!(sum.clone().finish().sum.unwrap_or(0.0)); }
-            }
+            if query.aggregate == "cumulative" { running_sum(&mut answer.values); }
         }
         answer.rows = reductions.iter().map(|r|r.rows).collect(); answer.units = units; answer.state = state.finish();
         Ok(answer)
@@ -674,10 +673,7 @@ impl Store {
                 for bin in &source.bins {
                     result.values.push(bin.finish(&query.aggregate,query.weather.is_some() && query.source != "stored",query.threshold)?);
                 }
-                if query.aggregate == "cumulative" {
-                    let mut sum = Accumulator::default();
-                    for value in &mut result.values { sum.add(value.as_f64()); *value = json!(sum.clone().finish().sum.unwrap_or(0.0)); }
-                }
+                if query.aggregate == "cumulative" { running_sum(&mut result.values); }
                 answer.answers[i] = result;
             }
         }
@@ -692,4 +688,11 @@ fn standard_value(value: Option<f64>, formula: &str, unit: Option<i64>) -> Optio
         "pressure" => value.map(|v|v/0.0295299875),
         _ => value,
     }
+}
+
+/// Replace per-interval sums by their running total, as WeeWX's cumulative
+/// series does. Empty intervals add nothing.
+fn running_sum(values: &mut [Json]) {
+    let mut sum = Accumulator::default();
+    for value in values { sum.add(value.as_f64()); *value = json!(sum.clone().finish().sum.unwrap_or(0.0)); }
 }

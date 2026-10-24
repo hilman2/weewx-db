@@ -106,21 +106,16 @@ class NativeXType(weewx.xtypes.XType):
         if aggregate_interval is None:
             raise weewx.UnknownAggregation(aggregate_interval)
         interval = weeutil.weeutil.nominal_spans(aggregate_interval)
-        if interval >= 86400 and computed is None:
-            try:
-                weewx.xtypes.DailySummaries.check_eligibility(
-                    obs_type, timespan, db_manager, aggregate_type)
-            except (weewx.UnknownType, weewx.UnknownAggregation):
-                pass
-            else:
-                # Daily extrema may originate in LOOP packets. They cannot be
-                # replaced by extrema calculated only from archive records.
-                raise weewx.UnknownAggregation(aggregate_type)
         ranges = [(a, b) for a, b in calculations.intervals(start, stop, aggregate_interval)
                   if db_manager.first_timestamp is not None
                   and b > db_manager.first_timestamp
                   and db_manager.last_timestamp is not None
                   and a < db_manager.last_timestamp]
+        if computed is None and calculations.daily_bins(obs_type, ranges, db_manager, aggregate_type, interval):
+            # Daily extrema may originate in LOOP packets. They cannot be
+            # replaced by extrema calculated only from archive records, so
+            # WeeWX aggregates each bin through get_aggregate.
+            raise weewx.UnknownAggregation(aggregate_type)
         if computed is None:
             values = native.series(db_manager.table_name, obs_type, ranges, aggregate_type)
             unit_system = db_manager.std_unit_system

@@ -1,6 +1,7 @@
 """Compare fused queries against WeeWX, including policies and cache invalidation."""
 
 import copy
+import math
 
 import pytest
 import weeutil.weeutil
@@ -220,6 +221,35 @@ def test_small_workspace_splits_sources_but_reuses_each_formula(tmp_path, monkey
         compare(actual, expected)
         assert statistics['scans'] == 3
         assert statistics['formula_evaluations'] == 3 * len(records)
+    finally:
+        baseline.close()
+        manager.close()
+
+
+def test_packet_falls_back_to_weewx_instead_of_stopping_the_engine(tmp_path, monkeypatch):
+    from weewxdb.services import StdWXCalculate
+    from weewxdb.almanac import NativeAlmanac
+    records = hardware_records(1704067200, 17, count=5)
+    baseline, manager = open_pair(tmp_path, records)
+
+    class OtherAlmanac(weewx.almanac.AlmanacType):
+        def get_almanac_data(self, almanac_obj, attr):
+            raise weewx.UnknownType(attr)
+    try:
+        monkeypatch.setattr(weewx.xtypes, 'xtypes', builtin_providers())
+        # An almanac extension the native maxSolarRad does not know.
+        monkeypatch.setattr(weewx.almanac, 'almanacs', [OtherAlmanac(), NativeAlmanac(), weewx.almanac.WeeutilAlmanacType()])
+        service = StdWXCalculate.__new__(StdWXCalculate)
+        service.db_manager = manager
+        record = dict(records[0], windGust=float('inf'))
+        record.pop('maxSolarRad', None)
+        service.do_calculations(record, {'maxSolarRad': 'prefer_hardware', 'dewpoint': 'software'})
+        assert record['maxSolarRad'] is not None
+        assert record['dewpoint'] == pytest.approx(weewx.wxformulas.dewpointC(record['outTemp'], record['outHumidity']))
+        # A NaN input reaches WeeWX's formula, as without the service.
+        record = dict(records[1], outTemp=float('nan'))
+        service.do_calculations(record, {'dewpoint': 'software'})
+        assert math.isnan(record['dewpoint'])
     finally:
         baseline.close()
         manager.close()

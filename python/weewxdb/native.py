@@ -194,7 +194,19 @@ def request(manager, query):
             raise weewx.UnsupportedFeature(str(error)) from error
         if 'no calculate' in str(error):
             raise weewx.NoCalculate from error
+        # Too many intervals for the workspace: WeeWX's own providers answer,
+        # slower, unless the caller asked for an explicit source policy.
+        if 'workspace exceeded' in str(error) and 'source' not in query:
+            raise weewx.UnknownType(query['observation']) from error
         raise
+
+
+def representable(value):
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, int):
+        return -2 ** 63 <= value < 2 ** 63
+    return True
 
 
 def scalar(observation, record, manager):
@@ -211,6 +223,10 @@ def scalar(observation, record, manager):
             if observation in ['windDir', 'windGustDir']:
                 raise weewx.NoCalculate
             raise weewx.CannotCalculate(observation)
+        # NaN, infinity and integers beyond 64 bits cannot enter a native
+        # request. WeeWX's own provider, next in the list, calculates them.
+        if any(not representable(record[name]) for name in spec['inputs']):
+            raise weewx.UnknownType(observation)
         result = request(manager, {'mode': 'weather', 'observation': observation, 'aggregate': 'avg',
                                    'ranges': [[math.floor(record['dateTime']), math.floor(record['dateTime'])]],
                                    'weather': spec, 'scalar_args': [record[name] for name in spec['inputs']]})
@@ -594,6 +610,22 @@ def intervals(start, stop, interval):
     return local(int(start), int(stop), int(seconds))
 
 
+def daily_bins(observation, ranges, manager, aggregate_type, interval):
+    """Return whether WeeWX would answer any of these bins from the daily
+    summaries.
+
+    WeeWX's ArchiveTable.get_series aggregates each bin on its own, and a
+    bin from midnight (or the first record) to midnight (or the newest
+    record) takes the daily summary, with its LOOP extrema. Below a day, only
+    a bin that ends at the newest record or starts at the first can qualify.
+    """
+    if aggregate_type not in weewx.xtypes.DailySummaries.common:
+        return False
+    if interval < 86400:
+        ranges = [r for r in ranges if r[1] == manager.last_timestamp or r[0] == manager.first_timestamp]
+    return any(eligible(observation, r, manager, aggregate_type) for r in ranges)
+
+
 def uses_daily(observation, span, manager, aggregate_type, aggregate_interval, options):
     """Return whether a series takes its aggregates from the daily summaries."""
     interval = weeutil.weeutil.nominal_spans(aggregate_interval) if aggregate_type else None
@@ -636,6 +668,9 @@ def prepare_series(observation, span, manager, aggregate_type=None, aggregate_in
                       and manager.last_timestamp is not None and a < manager.last_timestamp]
             if not ranges:
                 query = {'mode': 'archive', 'observation': observation, 'aggregate': aggregate_type, 'ranges': []}
+            elif options.get('source', 'auto') == 'auto' and daily_bins(observation, ranges, manager, aggregate_type, interval):
+                # Some bins, not all, take daily summaries; WeeWX dispatches per bin.
+                raise weewx.UnknownAggregation(aggregate_type)
             else:
                 query = query_for(observation, ranges[0], 'sum' if aggregate_type == 'cumulative' else aggregate_type, manager, options)
                 query['ranges'] = ranges
